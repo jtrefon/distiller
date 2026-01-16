@@ -18,8 +18,10 @@
 - Storage Refactoring: Decoupled storage interfaces (Ports & Adapters)
 - Storage Implementation: SQLite backend foundations (SqliteJobStore, SqliteTaskStore)
 - Storage Integration: Wiring SQLite backend into CLI configuration and startup logic
+- CI/CD Stabilization: Fixed coverage thresholds, upgraded dependencies (sqlx 0.8), and resolved security audits
 
 ## In Progress
+- Generation of detailed project reports
 
 ## Upcoming (Phase 2)
 
