@@ -167,7 +167,11 @@ fn structural_validator_complex_types() {
     let mut ctx = mk_ctx(p_valid);
     ctx.template = t.clone();
     let out = v.validate(&ctx);
-    assert!(out.passed, "Complex types valid case failed: {:?}", out.issues);
+    assert!(
+        out.passed,
+        "Complex types valid case failed: {:?}",
+        out.issues
+    );
 
     // Invalid array
     let p_inv_arr = serde_json::json!({
