@@ -108,12 +108,93 @@ fn structural_validator_passes_valid_sample() {
 }
 
 #[test]
-fn structural_validator_fails_wrong_type() {
+fn structural_validator_checks_all_types() {
     let v = StructuralValidator::new();
-    let parsed = serde_json::json!({"question":42,"answer":"A"});
-    let ctx = mk_ctx(parsed);
-    let outcome = v.validate(&ctx);
-    assert!(!outcome.passed);
+
+    // 1. Missing field
+    let p1 = serde_json::json!({"question": "Q"});
+    let ctx1 = mk_ctx(p1);
+    // Note: mk_ctx uses mk_template() which returns the schema.
+    let out1 = v.validate(&ctx1);
+    assert!(!out1.passed);
+    assert!(out1.issues.iter().any(|i| i.code == "schema.required"));
+
+    // 2. Wrong type (number instead of string)
+    let p2 = serde_json::json!({"question": 123, "answer": "A"});
+    let ctx2 = mk_ctx(p2);
+    let out2 = v.validate(&ctx2);
+    assert!(!out2.passed);
+    assert!(out2.issues.iter().any(|i| i.code == "schema.type"));
+
+    // 3. Not an object
+    let p3 = serde_json::json!([1, 2]);
+    let ctx3 = mk_ctx(p3);
+    let out3 = v.validate(&ctx3);
+    assert!(!out3.passed);
+    assert!(out3.issues.iter().any(|i| i.code == "schema.object"));
+}
+
+#[test]
+fn structural_validator_complex_types() {
+    // Create template with array/number/object fields
+    let mut t = mk_template();
+    t.schema.fields.push(TemplateSchemaField {
+        name: "scores".to_string(),
+        field_type: "array".to_string(),
+        required: true,
+    });
+    t.schema.fields.push(TemplateSchemaField {
+        name: "count".to_string(),
+        field_type: "number".to_string(),
+        required: true,
+    });
+    t.schema.fields.push(TemplateSchemaField {
+        name: "meta".to_string(),
+        field_type: "object".to_string(),
+        required: true,
+    });
+
+    let v = StructuralValidator::new();
+
+    // Valid case
+    let p_valid = serde_json::json!({
+        "question": "Q",
+        "answer": "A",
+        "scores": [1, 2],
+        "count": 10,
+        "meta": {"foo": "bar"}
+    });
+    let mut ctx = mk_ctx(p_valid);
+    ctx.template = t.clone();
+    let out = v.validate(&ctx);
+    assert!(out.passed, "Complex types valid case failed: {:?}", out.issues);
+
+    // Invalid array
+    let p_inv_arr = serde_json::json!({
+        "question": "Q", "answer": "A", "scores": "bad", "count": 10, "meta": {}
+    });
+    let mut ctx_inv = mk_ctx(p_inv_arr);
+    ctx_inv.template = t.clone();
+    let out_inv = v.validate(&ctx_inv);
+    assert!(!out_inv.passed);
+
+    // Invalid number
+    let p_inv_num = serde_json::json!({
+        "question": "Q", "answer": "A", "scores": [], "count": "bad", "meta": {}
+    });
+    let mut ctx_num = mk_ctx(p_inv_num);
+    ctx_num.template = t.clone();
+    let out_num = v.validate(&ctx_num);
+    assert!(!out_num.passed);
+
+    // Invalid object
+    let p_inv_obj = serde_json::json!({
+        "question": "Q", "answer": "A", "scores": [], "count": 10, "meta": 1
+    });
+    let mut ctx_obj = mk_ctx(p_inv_obj);
+    ctx_obj.template = t.clone();
+    let out_obj = v.validate(&ctx_obj);
+    assert!(!out_obj.passed);
 }
 
 #[test]
