@@ -15,11 +15,21 @@
 - Routing strategies: capability-based weighted selection
 - TUI metrics dashboard: real-time progress monitoring
 - README with quick start, lint/test/build, config examples
+- Storage Refactoring: Decoupled storage interfaces (Ports & Adapters)
+- Storage Implementation: SQLite backend foundations (SqliteJobStore, SqliteTaskStore)
 
 ## In Progress
 
-## Upcoming
+- **Storage Integration**: Wiring SQLite backend into CLI configuration and startup logic.
 
-- Distributed workers mode
-- Storage backends beyond filesystem (S3, GCS)
+## Upcoming (Phase 2)
 
+- **Enhanced TUI**: Job detail view, worker inspection, log filtering.
+- **Provider Plugins**: External provider support (WASM or IPC protocol).
+- **Advanced Validation**: LLM-based supervisors/judges.
+- **Storage Expansion**: S3/GCS dataset writers.
+
+## Future (Phase 3)
+
+- **Distributed Workers**: Remote worker nodes.
+- **Web Dashboard**: Optional web-based control plane.

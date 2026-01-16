@@ -67,30 +67,33 @@ impl Validator for SemanticDedupValidator {
             // In a real scenario, we might want to target specific fields.
             let text = serde_json::to_string(parsed).unwrap_or_default();
             let tokens = Self::tokenize(&text);
-            
+
             let mut guard = self.seen_tokens.lock().unwrap();
-            
+
             for seen in guard.iter() {
                 let sim = Self::jaccard_index(&tokens, seen);
                 if sim >= self.threshold {
-                     let mut details = HashMap::new();
-                     details.insert("reason".to_string(), "semantically similar sample exists".to_string());
-                     details.insert("similarity".to_string(), format!("{:.2}", sim));
-                     return ValidationOutcome {
-                         passed: false,
-                         issues: vec![ValidationIssue {
-                             code: "dedup.semantic".to_string(),
-                             message: "duplicate detected (semantic)".to_string(),
-                             severity: ValidationSeverity::Error,
-                             details,
-                         }],
-                         score: Some(0.0),
-                     };
+                    let mut details = HashMap::new();
+                    details.insert(
+                        "reason".to_string(),
+                        "semantically similar sample exists".to_string(),
+                    );
+                    details.insert("similarity".to_string(), format!("{:.2}", sim));
+                    return ValidationOutcome {
+                        passed: false,
+                        issues: vec![ValidationIssue {
+                            code: "dedup.semantic".to_string(),
+                            message: "duplicate detected (semantic)".to_string(),
+                            severity: ValidationSeverity::Error,
+                            details,
+                        }],
+                        score: Some(0.0),
+                    };
                 }
             }
-            
+
             guard.push(tokens);
-            
+
             ValidationOutcome {
                 passed: true,
                 issues: vec![],
@@ -128,7 +131,6 @@ fn check_schema(template: &TemplateConfig, value: &Value) -> Vec<ValidationIssue
                         details,
                     });
                 }
-
             }
             Err(e) => {
                 let mut d = HashMap::new();

@@ -233,8 +233,10 @@ impl JobStore for SqliteJobStore {
 
             let config = serde_json::from_str(&config_json)?;
             let status = serde_json::from_str(&status_str)?;
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)?.with_timezone(&chrono::Utc);
-            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)?.with_timezone(&chrono::Utc);
+            let created_at =
+                chrono::DateTime::parse_from_rfc3339(&created_at_str)?.with_timezone(&chrono::Utc);
+            let updated_at =
+                chrono::DateTime::parse_from_rfc3339(&updated_at_str)?.with_timezone(&chrono::Utc);
 
             Ok(Some(Job {
                 id: id.clone(),
@@ -287,8 +289,10 @@ impl JobStore for SqliteJobStore {
 
             let config = serde_json::from_str(&config_json)?;
             let status = serde_json::from_str(&status_str)?;
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)?.with_timezone(&chrono::Utc);
-            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)?.with_timezone(&chrono::Utc);
+            let created_at =
+                chrono::DateTime::parse_from_rfc3339(&created_at_str)?.with_timezone(&chrono::Utc);
+            let updated_at =
+                chrono::DateTime::parse_from_rfc3339(&updated_at_str)?.with_timezone(&chrono::Utc);
 
             jobs.push(Job {
                 id,

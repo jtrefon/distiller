@@ -119,7 +119,7 @@ fn structural_validator_fails_wrong_type() {
 #[test]
 fn semantic_dedup_validator_blocks_similar() {
     let v = SemanticDedupValidator::new(0.5);
-    
+
     // Sample 1: "The quick brown fox"
     let parsed1 = serde_json::json!({"text": "The quick brown fox"});
     let ctx1 = mk_ctx(parsed1);
