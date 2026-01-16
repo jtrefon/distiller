@@ -19,6 +19,7 @@ pub trait TaskStore: Send + Sync {
     async fn enqueue_task(&self, task: Task) -> anyhow::Result<()>;
     async fn fetch_next_task(&self) -> anyhow::Result<Option<Task>>;
     async fn update_task(&self, task: &Task) -> anyhow::Result<()>;
+    async fn list_tasks(&self, job_id: &JobId) -> anyhow::Result<Vec<Task>>;
 }
 
 #[async_trait]
@@ -120,6 +121,17 @@ impl TaskStore for InMemoryTaskStore {
             .unwrap()
             .insert(task.id.clone(), task.clone());
         Ok(())
+    }
+
+    async fn list_tasks(&self, job_id: &JobId) -> anyhow::Result<Vec<Task>> {
+        let tasks: Vec<Task> = self.states
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|t| &t.job_id == job_id)
+            .cloned()
+            .collect();
+        Ok(tasks)
     }
 }
 
@@ -461,5 +473,50 @@ impl TaskStore for SqliteTaskStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn list_tasks(&self, job_id: &JobId) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query("SELECT * FROM tasks WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            let id: String = row.get("id");
+            let job_id: String = row.get("job_id");
+            let state_str: String = row.get("state");
+            let attempts: i64 = row.get("attempts");
+            let max_attempts: i64 = row.get("max_attempts");
+            let provider_id: Option<String> = row.get("provider_id");
+            let domain_id: String = row.get("domain_id");
+            let template_id: String = row.get("template_id");
+            let prompt_spec_str: String = row.get("prompt_spec");
+            let raw_response: Option<String> = row.get("raw_response");
+            let validation_result_str: Option<String> = row.get("validation_result");
+
+            let state = serde_json::from_str(&state_str)?;
+            let prompt_spec = serde_json::from_str(&prompt_spec_str)?;
+            let validation_result = if let Some(s) = validation_result_str {
+                Some(serde_json::from_str(&s)?)
+            } else {
+                None
+            };
+
+            tasks.push(Task {
+                id,
+                job_id,
+                state,
+                attempts: attempts as u32,
+                max_attempts: max_attempts as u32,
+                provider_id,
+                domain_id,
+                template_id,
+                prompt_spec,
+                raw_response,
+                validation_result,
+            });
+        }
+        Ok(tasks)
     }
 }

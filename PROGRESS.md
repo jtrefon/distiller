@@ -19,14 +19,15 @@
 - Storage Implementation: SQLite backend foundations (SqliteJobStore, SqliteTaskStore)
 - Storage Integration: Wiring SQLite backend into CLI configuration and startup logic
 - CI/CD Stabilization: Fixed coverage thresholds, upgraded dependencies (sqlx 0.8), and resolved security audits
+- Enhanced TUI: Added job detail views, task listing, and real-time state management
+- Provider Plugin System: Implemented ScriptProvider for external integration (Python, binaries via stdio)
+- CLI Configuration: Updated to support pluggable provider configuration (Script, OpenRouter, Ollama)
 
 ## In Progress
 - Generation of detailed project reports
 
 ## Upcoming (Phase 2)
 
-- **Enhanced TUI**: Job detail view, worker inspection, log filtering.
-- **Provider Plugins**: External provider support (WASM or IPC protocol).
 - **Advanced Validation**: LLM-based supervisors/judges.
 - **Storage Expansion**: S3/GCS dataset writers.
 

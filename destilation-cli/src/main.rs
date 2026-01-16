@@ -1,5 +1,5 @@
 pub mod tui;
-use crate::tui::Tui;
+use crate::tui::{Tui, TuiUpdate};
 use clap::Parser;
 use destilation_core::domain::{
     DomainSpec, JobConfig, JobOutputConfig, JobProviderSpec, JobValidationConfig, ReasoningMode,
@@ -7,8 +7,6 @@ use destilation_core::domain::{
 };
 use destilation_core::metrics::{InMemoryMetrics, Metrics};
 use destilation_core::orchestrator::Orchestrator;
-use destilation_core::providers::MockProvider;
-use destilation_core::providers::{OllamaProvider, OpenRouterProvider};
 use destilation_core::storage::{
     FilesystemDatasetWriter, InMemoryJobStore, InMemoryTaskStore, JobStore, SqliteJobStore,
     SqliteTaskStore, TaskStore,
@@ -48,10 +46,14 @@ struct RuntimeConfig {
     database_url: Option<String>,
 }
 
+use destilation_core::provider::ProviderConfig;
+use destilation_core::providers::create_provider;
+
 #[derive(serde::Deserialize)]
 struct ProvidersConfig {
     openrouter: Option<OpenRouterConfig>,
     ollama: Option<OllamaConfig>,
+    scripts: Option<HashMap<String, ScriptProviderConfig>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -65,6 +67,13 @@ struct OpenRouterConfig {
 struct OllamaConfig {
     base_url: String,
     model: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ScriptProviderConfig {
+    command: String,
+    args: Option<Vec<String>>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -232,27 +241,47 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
 
     let mut providers: HashMap<String, Arc<dyn destilation_core::provider::ModelProvider>> =
         HashMap::new();
-    let mock = Arc::new(MockProvider::new("mock".to_string()));
+    let mock = Arc::from(create_provider(ProviderConfig::Mock {
+        id: "mock".to_string(),
+    }));
     providers.insert("mock".to_string(), mock);
+
     if let Some(pconf) = gc.as_ref().and_then(|g| g.providers.as_ref()) {
         if let Some(or) = &pconf.openrouter {
             if let Ok(key) = std::env::var(&or.api_key_env) {
-                let p = Arc::new(OpenRouterProvider::new(
+                let config = ProviderConfig::OpenRouter {
+                    id: "openrouter".to_string(),
+                    base_url: or.base_url.clone(),
+                    api_key: key,
+                    model: or.model.clone(),
+                };
+                providers.insert(
                     "openrouter".to_string(),
-                    or.base_url.clone(),
-                    key,
-                    or.model.clone(),
-                ));
-                providers.insert("openrouter".to_string(), p);
+                    Arc::from(create_provider(config)),
+                );
             }
         }
         if let Some(ol) = &pconf.ollama {
-            let p = Arc::new(OllamaProvider::new(
+            let config = ProviderConfig::Ollama {
+                id: "ollama".to_string(),
+                base_url: ol.base_url.clone(),
+                model: ol.model.clone(),
+            };
+            providers.insert(
                 "ollama".to_string(),
-                ol.base_url.clone(),
-                ol.model.clone(),
-            ));
-            providers.insert("ollama".to_string(), p);
+                Arc::from(create_provider(config)),
+            );
+        }
+        if let Some(scripts) = &pconf.scripts {
+            for (id, script_conf) in scripts {
+                let config = ProviderConfig::Script {
+                    id: id.clone(),
+                    command: script_conf.command.clone(),
+                    args: script_conf.args.clone().unwrap_or_default(),
+                    timeout_ms: script_conf.timeout_ms,
+                };
+                providers.insert(id.clone(), Arc::from(create_provider(config)));
+            }
         }
     }
 
@@ -379,7 +408,23 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
 
     let handle = tokio::spawn(async move { orchestrator_clone.run_job(&job_id).await });
 
-    let tui = Tui::new(metrics_clone);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let orchestrator_monitor = orchestrator.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Ok(jobs) = orchestrator_monitor.job_store.list_jobs().await {
+                let _ = tx.send(TuiUpdate::Jobs(jobs.clone()));
+                for job in jobs {
+                    if let Ok(tasks) = orchestrator_monitor.task_store.list_tasks(&job.id).await {
+                        let _ = tx.send(TuiUpdate::Tasks(job.id, tasks));
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    });
+
+    let mut tui = Tui::new(metrics_clone, rx);
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let done_clone = done.clone();
     tokio::spawn(async move {

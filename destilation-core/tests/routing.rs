@@ -40,6 +40,12 @@ impl TaskStore for DummyStore {
     async fn update_task(&self, _task: &destilation_core::domain::Task) -> anyhow::Result<()> {
         unimplemented!()
     }
+    async fn list_tasks(
+        &self,
+        _job_id: &String,
+    ) -> anyhow::Result<Vec<destilation_core::domain::Task>> {
+        unimplemented!()
+    }
 }
 #[async_trait::async_trait]
 impl DatasetWriter for DummyStore {

@@ -54,10 +54,39 @@ pub enum ProviderError {
     Unavailable,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ProviderConfig {
+    OpenRouter {
+        id: ProviderId,
+        base_url: String,
+        api_key: String,
+        model: String,
+    },
+    Ollama {
+        id: ProviderId,
+        base_url: String,
+        model: String,
+    },
+    Script {
+        id: ProviderId,
+        command: String,
+        args: Vec<String>,
+        timeout_ms: Option<u64>,
+    },
+    Mock {
+        id: ProviderId,
+    },
+}
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn metadata(&self) -> ProviderMetadata;
 
     async fn generate(&self, request: GenerationRequest)
         -> Result<GenerationResult, ProviderError>;
+
+    async fn health_check(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
 }
