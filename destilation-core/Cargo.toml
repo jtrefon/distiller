@@ -17,3 +17,4 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "process", "io-util"] }
 
 [dev-dependencies]
+async-trait = "0.1"

@@ -2,6 +2,7 @@ use destilation_core::domain::{
     DomainSpec, JobConfig, JobOutputConfig, JobProviderSpec, JobValidationConfig, ReasoningMode,
     TemplateConfig, TemplateId, TemplateMode, TemplateSchema, TemplateSchemaField,
 };
+use destilation_core::logging::NoopEventLogger;
 use destilation_core::metrics::{InMemoryMetrics, Metrics};
 use destilation_core::orchestrator::Orchestrator;
 use destilation_core::provider::{
@@ -112,6 +113,7 @@ async fn metrics_count_basic_flow() {
         validators,
         dataset_writer,
         metrics: metrics.clone(),
+        logger: Arc::new(NoopEventLogger),
     };
 
     let job_config = JobConfig {

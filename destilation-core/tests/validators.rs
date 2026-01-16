@@ -61,7 +61,9 @@ fn mk_ctx(parsed: serde_json::Value) -> ValidationContext {
         },
         status: destilation_core::domain::JobStatus::Pending,
         created_at: chrono::Utc::now(),
+        started_at: None,
         updated_at: chrono::Utc::now(),
+        finished_at: None,
         completed_samples: 0,
     };
     let task = destilation_core::domain::Task {

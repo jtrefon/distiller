@@ -3,9 +3,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use destilation_core::domain::{
-    Job, JobConfig, ProviderId, Task, TemplateConfig,
-};
+use destilation_core::domain::{Job, JobConfig, ProviderId, Task, TemplateConfig};
+use destilation_core::logging::LogEvent;
 use destilation_core::metrics::{Metrics, MetricsSnapshot};
 use destilation_core::provider::ProviderConfig;
 use ratatui::{
@@ -38,6 +37,7 @@ pub enum TuiUpdate {
     Tasks(JobId, Vec<Task>),
     Providers(Vec<ProviderConfig>),
     Templates(Vec<TemplateConfig>),
+    LogEvents(Vec<LogEvent>),
 }
 
 type JobId = String;
@@ -50,6 +50,7 @@ struct TuiState {
     view: View,
     show_help: bool,
     is_done: bool,
+    show_logs: bool,
 
     // Provider Management
     providers: Vec<ProviderConfig>,
@@ -67,6 +68,7 @@ struct TuiState {
     templates: Vec<TemplateConfig>,
     job_create_name: String,
     job_create_domain: String,
+    job_create_samples: String,
     job_create_template_state: ListState,
     job_create_field_idx: usize,
 
@@ -76,6 +78,10 @@ struct TuiState {
     // Global Navigation State
     focus: FocusArea,
     selected_f_key_index: usize,
+
+    started_at: std::time::Instant,
+    dataset_root: String,
+    job_logs: HashMap<JobId, Vec<LogEvent>>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -98,7 +104,7 @@ enum FocusArea {
 
 impl TuiState {
     fn new() -> Self {
-        let state = Self {
+        Self {
             jobs: Vec::new(),
             tasks: HashMap::new(),
             job_list_state: ListState::default(),
@@ -106,6 +112,7 @@ impl TuiState {
             view: View::Dashboard,
             show_help: false,
             is_done: false,
+            show_logs: false,
 
             providers: Vec::new(),
             provider_list_state: ListState::default(),
@@ -141,6 +148,7 @@ impl TuiState {
             templates: Vec::new(),
             job_create_name: String::new(),
             job_create_domain: String::new(),
+            job_create_samples: "100".to_string(),
             job_create_template_state: ListState::default(),
             job_create_field_idx: 0,
 
@@ -148,8 +156,25 @@ impl TuiState {
 
             focus: FocusArea::Main,
             selected_f_key_index: 0,
-        };
-        state
+
+            started_at: std::time::Instant::now(),
+            dataset_root: "datasets/default".to_string(),
+            job_logs: HashMap::new(),
+        }
+    }
+
+    fn push_log_events(&mut self, events: Vec<LogEvent>) {
+        for ev in events {
+            let Some(job_id) = ev.job_id.clone() else {
+                continue;
+            };
+            let buf = self.job_logs.entry(job_id).or_default();
+            buf.push(ev);
+            if buf.len() > 500 {
+                let drop = buf.len() - 500;
+                buf.drain(0..drop);
+            }
+        }
     }
 
     fn update_filtered_models(&mut self) {
@@ -187,6 +212,7 @@ impl TuiState {
             None => 0,
         };
         self.job_list_state.select(Some(i));
+        self.sync_selected_job_id();
     }
 
     fn previous_job(&mut self) {
@@ -204,6 +230,26 @@ impl TuiState {
             None => 0,
         };
         self.job_list_state.select(Some(i));
+        self.sync_selected_job_id();
+    }
+
+    fn sync_selected_job_id(&mut self) {
+        let selected = self
+            .job_list_state
+            .selected()
+            .and_then(|i| self.jobs.get(i))
+            .map(|j| j.id.clone());
+        self.selected_job_id = selected;
+    }
+
+    fn selected_job_id_or_highlighted(&self) -> Option<JobId> {
+        if let Some(id) = &self.selected_job_id {
+            return Some(id.clone());
+        }
+        self.job_list_state
+            .selected()
+            .and_then(|i| self.jobs.get(i))
+            .map(|j| j.id.clone())
     }
 
     fn enter_job(&mut self) {
@@ -217,7 +263,14 @@ impl TuiState {
 
     fn exit_detail(&mut self) {
         self.view = View::Dashboard;
-        self.selected_job_id = None;
+        if let Some(id) = &self.selected_job_id {
+            if let Some(pos) = self.jobs.iter().position(|j| &j.id == id) {
+                self.job_list_state.select(Some(pos));
+            }
+        } else if !self.jobs.is_empty() {
+            self.job_list_state.select(Some(0));
+            self.sync_selected_job_id();
+        }
     }
 }
 
@@ -233,12 +286,15 @@ impl Tui {
         metrics: Arc<dyn Metrics>,
         rx: mpsc::Receiver<TuiUpdate>,
         tx_cmd: mpsc::Sender<TuiCommand>,
+        dataset_root: String,
     ) -> Self {
+        let mut state = TuiState::new();
+        state.dataset_root = dataset_root;
         Self {
             metrics,
             rx,
             tx_cmd,
-            state: TuiState::new(),
+            state,
         }
     }
 
@@ -283,6 +339,19 @@ impl Tui {
                         {
                             self.state.job_list_state.select(Some(0));
                         }
+                        if self.state.selected_job_id.is_none() {
+                            self.state.sync_selected_job_id();
+                        } else if let Some(id) = &self.state.selected_job_id {
+                            if let Some(pos) = self.state.jobs.iter().position(|j| &j.id == id) {
+                                self.state.job_list_state.select(Some(pos));
+                            } else if !self.state.jobs.is_empty() {
+                                self.state.job_list_state.select(Some(0));
+                                self.state.sync_selected_job_id();
+                            } else {
+                                self.state.selected_job_id = None;
+                                self.state.job_list_state.select(None);
+                            }
+                        }
                     }
                     TuiUpdate::Tasks(job_id, tasks) => {
                         self.state.tasks.insert(job_id, tasks);
@@ -300,6 +369,9 @@ impl Tui {
                         if !self.state.templates.is_empty() {
                             self.state.job_create_template_state.select(Some(0));
                         }
+                    }
+                    TuiUpdate::LogEvents(events) => {
+                        self.state.push_log_events(events);
                     }
                 }
             }
@@ -352,9 +424,16 @@ impl Tui {
                                                         state.focus = FocusArea::Main;
                                                     }
                                                 } else if state.view == View::JobCreate {
-                                                    if !state.job_create_name.is_empty() && !state.job_create_domain.is_empty() {
-                                                        if let Some(idx) = state.job_create_template_state.selected() {
-                                                            if let Some(template) = state.templates.get(idx) {
+                                                    if !state.job_create_name.is_empty()
+                                                        && !state.job_create_domain.is_empty()
+                                                    {
+                                                        if let Some(idx) = state
+                                                            .job_create_template_state
+                                                            .selected()
+                                                        {
+                                                            if let Some(template) =
+                                                                state.templates.get(idx)
+                                                            {
                                                                 let providers: Vec<destilation_core::domain::JobProviderSpec> = state.providers.iter()
                                                                     .filter(|p| p.is_enabled())
                                                                     .map(|p| destilation_core::domain::JobProviderSpec {
@@ -375,7 +454,7 @@ impl Tui {
                                                                     id: format!("job-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
                                                                     name: state.job_create_name.clone(),
                                                                     description: None,
-                                                                    target_samples: 100,
+                                                                    target_samples: state.job_create_samples.parse().unwrap_or(10),
                                                                     max_concurrency: 4,
                                                                     domains,
                                                                     template_id: template.id.clone(),
@@ -394,14 +473,24 @@ impl Tui {
                                                                         metadata: HashMap::new(),
                                                                     },
                                                                 };
-                                                                let _ = self.tx_cmd.send(TuiCommand::StartJob(config));
+                                                                let _ = self.tx_cmd.send(
+                                                                    TuiCommand::StartJob(config),
+                                                                );
                                                                 state.view = View::Dashboard;
                                                             }
                                                         }
                                                     }
                                                 } else if state.view == View::Dashboard {
-                                                    if let Some(job_id) = &state.selected_job_id {
-                                                        if let Some(job) = state.jobs.iter().find(|j| &j.id == job_id) {
+                                                    if let Some(job_id) =
+                                                        state.selected_job_id_or_highlighted()
+                                                    {
+                                                        state.selected_job_id =
+                                                            Some(job_id.clone());
+                                                        if let Some(job) = state
+                                                            .jobs
+                                                            .iter()
+                                                            .find(|j| j.id == job_id)
+                                                        {
                                                             match job.status {
                                                                 destilation_core::domain::JobStatus::Running => {
                                                                     let _ = self.tx_cmd.send(TuiCommand::PauseJob(job_id.clone()));
@@ -455,7 +544,9 @@ impl Tui {
                                                         }
                                                     }
                                                 } else if state.view == View::Dashboard {
-                                                    if let Some(job_id) = &state.selected_job_id {
+                                                    if let Some(job_id) =
+                                                        state.selected_job_id_or_highlighted()
+                                                    {
                                                         let _ = self.tx_cmd.send(
                                                             TuiCommand::DeleteJob(job_id.clone()),
                                                         );
@@ -525,30 +616,57 @@ impl Tui {
                                         state.focus = FocusArea::Main;
                                     }
                                 } else if state.view == View::JobCreate {
-                                    if !state.job_create_name.is_empty() && !state.job_create_domain.is_empty() {
-                                        if let Some(idx) = state.job_create_template_state.selected() {
+                                    if !state.job_create_name.is_empty()
+                                        && !state.job_create_domain.is_empty()
+                                    {
+                                        if let Some(idx) =
+                                            state.job_create_template_state.selected()
+                                        {
                                             if let Some(template) = state.templates.get(idx) {
-                                                let providers: Vec<destilation_core::domain::JobProviderSpec> = state.providers.iter()
+                                                let providers: Vec<
+                                                    destilation_core::domain::JobProviderSpec,
+                                                > = state
+                                                    .providers
+                                                    .iter()
                                                     .filter(|p| p.is_enabled())
-                                                    .map(|p| destilation_core::domain::JobProviderSpec {
-                                                        provider_id: p.id().clone(),
-                                                        weight: 1.0,
-                                                        capabilities_required: vec![],
+                                                    .map(|p| {
+                                                        destilation_core::domain::JobProviderSpec {
+                                                            provider_id: p.id().clone(),
+                                                            weight: 1.0,
+                                                            capabilities_required: vec![],
+                                                        }
                                                     })
                                                     .collect();
 
-                                                let domains = vec![destilation_core::domain::DomainSpec {
-                                                    id: format!("domain-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
-                                                    name: state.job_create_domain.clone(),
-                                                    weight: 1.0,
-                                                    tags: vec![],
-                                                }];
+                                                let domains =
+                                                    vec![destilation_core::domain::DomainSpec {
+                                                        id: format!(
+                                                            "domain-{}",
+                                                            std::time::SystemTime::now()
+                                                                .duration_since(
+                                                                    std::time::UNIX_EPOCH
+                                                                )
+                                                                .unwrap()
+                                                                .as_secs()
+                                                        ),
+                                                        name: state.job_create_domain.clone(),
+                                                        weight: 1.0,
+                                                        tags: vec![],
+                                                    }];
+
+                                                let job_id = format!(
+                                                    "job-{}",
+                                                    std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap()
+                                                        .as_secs()
+                                                );
 
                                                 let config = JobConfig {
-                                                    id: format!("job-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+                                                    id: job_id.clone(),
                                                     name: state.job_create_name.clone(),
                                                     description: None,
-                                                    target_samples: 100,
+                                                    target_samples: state.job_create_samples.parse().unwrap_or(10),
                                                     max_concurrency: 4,
                                                     domains,
                                                     template_id: template.id.clone(),
@@ -561,26 +679,38 @@ impl Tui {
                                                         fail_fast: false,
                                                     },
                                                     output: destilation_core::domain::JobOutputConfig {
-                                                        dataset_dir: "./datasets".to_string(),
+                                                        dataset_dir: format!(
+                                                            "{}/{}",
+                                                            state.dataset_root, job_id
+                                                        ),
                                                         shard_size: 1000,
                                                         compress: false,
                                                         metadata: HashMap::new(),
                                                     },
                                                 };
-                                                let _ = self.tx_cmd.send(TuiCommand::StartJob(config));
+                                                let _ =
+                                                    self.tx_cmd.send(TuiCommand::StartJob(config));
                                                 state.view = View::Dashboard;
                                             }
                                         }
                                     }
                                 } else if state.view == View::Dashboard {
-                                    if let Some(job_id) = &state.selected_job_id {
-                                        if let Some(job) = state.jobs.iter().find(|j| &j.id == job_id) {
+                                    if let Some(job_id) = state.selected_job_id_or_highlighted() {
+                                        state.selected_job_id = Some(job_id.clone());
+                                        if let Some(job) =
+                                            state.jobs.iter().find(|j| j.id == job_id)
+                                        {
                                             match job.status {
                                                 destilation_core::domain::JobStatus::Running => {
-                                                    let _ = self.tx_cmd.send(TuiCommand::PauseJob(job_id.clone()));
+                                                    let _ = self
+                                                        .tx_cmd
+                                                        .send(TuiCommand::PauseJob(job_id.clone()));
                                                 }
-                                                destilation_core::domain::JobStatus::Paused | destilation_core::domain::JobStatus::Pending => {
-                                                    let _ = self.tx_cmd.send(TuiCommand::ResumeJob(job_id.clone()));
+                                                destilation_core::domain::JobStatus::Paused
+                                                | destilation_core::domain::JobStatus::Pending => {
+                                                    let _ = self.tx_cmd.send(
+                                                        TuiCommand::ResumeJob(job_id.clone()),
+                                                    );
                                                 }
                                                 _ => {}
                                             }
@@ -602,6 +732,11 @@ impl Tui {
                                             state.focus = FocusArea::Main;
                                         }
                                     }
+                                }
+                            }
+                            KeyCode::F(6) => {
+                                if state.view == View::Dashboard {
+                                    state.show_logs = !state.show_logs;
                                 }
                             }
                             KeyCode::F(7) => {
@@ -640,11 +775,14 @@ impl Tui {
                                 if state.view == View::ProviderEdit {
                                     // Check if we are editing a new provider (not in the list yet)
                                     let is_new = if let Some(p) = &state.editing_provider {
-                                        !state.providers.iter().any(|existing| existing.id() == p.id())
+                                        !state
+                                            .providers
+                                            .iter()
+                                            .any(|existing| existing.id() == p.id())
                                     } else {
                                         false
                                     };
-                                    
+
                                     if is_new {
                                         state.view = View::ProviderTypeSelect;
                                     } else {
@@ -668,7 +806,7 @@ impl Tui {
 
                         if state.focus == FocusArea::BottomBar {
                             let active_indices: Vec<usize> = match state.view {
-                                View::Dashboard => vec![0, 1, 2, 6, 7, 9, 10, 11],
+                                View::Dashboard => vec![0, 1, 2, 5, 6, 7, 9, 10, 11],
                                 View::ProviderList => vec![0, 3, 6, 7, 9, 10],
                                 View::ProviderEdit => vec![0, 1, 8, 9, 10],
                                 View::ModelSelect => vec![0, 8, 9],
@@ -714,22 +852,29 @@ impl Tui {
                                         state.focus = FocusArea::Main;
                                     }
                                 }
-                                KeyCode::Enter => match state.selected_f_key_index {
-                                    0 => state.show_help = !state.show_help,
-                                    1 => {
-                                        if state.view == View::ProviderEdit {
-                                            if let Some(p) = &state.editing_provider {
-                                                let _ = self
-                                                    .tx_cmd
-                                                    .send(TuiCommand::SaveProvider(p.clone()));
-                                                state.view = View::ProviderList;
-                                                state.focus = FocusArea::Main;
-                                            }
-                                        } else if state.view == View::JobCreate {
-                                            if !state.job_create_name.is_empty() && !state.job_create_domain.is_empty() {
-                                                if let Some(idx) = state.job_create_template_state.selected() {
-                                                    if let Some(template) = state.templates.get(idx) {
-                                                        let providers: Vec<destilation_core::domain::JobProviderSpec> = state.providers.iter()
+                                KeyCode::Enter => {
+                                    match state.selected_f_key_index {
+                                        0 => state.show_help = !state.show_help,
+                                        1 => {
+                                            if state.view == View::ProviderEdit {
+                                                if let Some(p) = &state.editing_provider {
+                                                    let _ = self
+                                                        .tx_cmd
+                                                        .send(TuiCommand::SaveProvider(p.clone()));
+                                                    state.view = View::ProviderList;
+                                                    state.focus = FocusArea::Main;
+                                                }
+                                            } else if state.view == View::JobCreate {
+                                                if !state.job_create_name.is_empty()
+                                                    && !state.job_create_domain.is_empty()
+                                                {
+                                                    if let Some(idx) =
+                                                        state.job_create_template_state.selected()
+                                                    {
+                                                        if let Some(template) =
+                                                            state.templates.get(idx)
+                                                        {
+                                                            let providers: Vec<destilation_core::domain::JobProviderSpec> = state.providers.iter()
                                                             .filter(|p| p.is_enabled())
                                                             .map(|p| destilation_core::domain::JobProviderSpec {
                                                                 provider_id: p.id().clone(),
@@ -738,18 +883,18 @@ impl Tui {
                                                             })
                                                             .collect();
 
-                                                        let domains = vec![destilation_core::domain::DomainSpec {
+                                                            let domains = vec![destilation_core::domain::DomainSpec {
                                                             id: format!("domain-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
                                                             name: state.job_create_domain.clone(),
                                                             weight: 1.0,
                                                             tags: vec![],
                                                         }];
 
-                                                        let config = JobConfig {
+                                                            let config = JobConfig {
                                                             id: format!("job-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
                                                             name: state.job_create_name.clone(),
                                                             description: None,
-                                                            target_samples: 100,
+                                                            target_samples: state.job_create_samples.parse().unwrap_or(10),
                                                             max_concurrency: 4,
                                                             domains,
                                                             template_id: template.id.clone(),
@@ -768,15 +913,19 @@ impl Tui {
                                                                 metadata: HashMap::new(),
                                                             },
                                                         };
-                                                        let _ = self.tx_cmd.send(TuiCommand::StartJob(config));
-                                                        state.view = View::Dashboard;
+                                                            let _ = self
+                                                                .tx_cmd
+                                                                .send(TuiCommand::StartJob(config));
+                                                            state.view = View::Dashboard;
+                                                        }
                                                     }
                                                 }
-                                            }
-                                        } else if state.view == View::Dashboard {
-                                            if let Some(job_id) = &state.selected_job_id {
-                                                if let Some(job) = state.jobs.iter().find(|j| &j.id == job_id) {
-                                                    match job.status {
+                                            } else if state.view == View::Dashboard {
+                                                if let Some(job_id) = &state.selected_job_id {
+                                                    if let Some(job) =
+                                                        state.jobs.iter().find(|j| &j.id == job_id)
+                                                    {
+                                                        match job.status {
                                                         destilation_core::domain::JobStatus::Running => {
                                                             let _ = self.tx_cmd.send(TuiCommand::PauseJob(job_id.clone()));
                                                         }
@@ -785,90 +934,101 @@ impl Tui {
                                                         }
                                                         _ => {}
                                                     }
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    2 => {
-                                        state.view = View::Dashboard;
-                                        state.focus = FocusArea::Main;
-                                    }
-                                    3 => {
-                                        if state.view == View::ProviderList {
-                                            if let Some(i) = state.provider_list_state.selected() {
-                                                if let Some(p) = state.providers.get(i) {
-                                                    state.editing_provider = Some(p.clone());
-                                                    state.view = View::ProviderEdit;
-                                                    state.edit_field_index = 0;
-                                                    state.focus = FocusArea::Main;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    6 => {
-                                        if state.view == View::ProviderList {
-                                            state.view = View::ProviderTypeSelect;
-                                            state.provider_type_idx = 0;
+                                        2 => {
+                                            state.view = View::Dashboard;
                                             state.focus = FocusArea::Main;
-                                        } else if state.view == View::Dashboard {
-                                            state.view = View::JobCreate;
-                                            state.job_create_name = String::new();
-                                            state.job_create_field_idx = 0;
-                                            state.focus = FocusArea::Main;
-                                            if !state.templates.is_empty() {
-                                                state.job_create_template_state.select(Some(0));
-                                            }
                                         }
-                                    }
-                                    7 => {
-                                        if state.view == View::ProviderList {
-                                            if let Some(i) = state.provider_list_state.selected() {
-                                                if let Some(p) = state.providers.get(i) {
-                                                    let _ = self.tx_cmd.send(
-                                                        TuiCommand::DeleteProvider(p.id().clone()),
-                                                    );
+                                        3 => {
+                                            if state.view == View::ProviderList {
+                                                if let Some(i) =
+                                                    state.provider_list_state.selected()
+                                                {
+                                                    if let Some(p) = state.providers.get(i) {
+                                                        state.editing_provider = Some(p.clone());
+                                                        state.view = View::ProviderEdit;
+                                                        state.edit_field_index = 0;
+                                                        state.focus = FocusArea::Main;
+                                                    }
                                                 }
                                             }
-                                        } else if state.view == View::Dashboard {
-                                            if let Some(job_id) = &state.selected_job_id {
-                                                let _ = self
-                                                    .tx_cmd
-                                                    .send(TuiCommand::DeleteJob(job_id.clone()));
-                                                state.selected_job_id = None;
-                                            }
                                         }
-                                    }
-                                    8 => {
-                                        // F9 Back
-                                        if state.view == View::ProviderEdit {
-                                            let is_new = if let Some(p) = &state.editing_provider {
-                                                !state.providers.iter().any(|existing| existing.id() == p.id())
-                                            } else {
-                                                false
-                                            };
-                                            
-                                            if is_new {
+                                        6 => {
+                                            if state.view == View::ProviderList {
                                                 state.view = View::ProviderTypeSelect;
-                                            } else {
-                                                state.view = View::ProviderList;
+                                                state.provider_type_idx = 0;
+                                                state.focus = FocusArea::Main;
+                                            } else if state.view == View::Dashboard {
+                                                state.view = View::JobCreate;
+                                                state.job_create_name = String::new();
+                                                state.job_create_field_idx = 0;
+                                                state.focus = FocusArea::Main;
+                                                if !state.templates.is_empty() {
+                                                    state.job_create_template_state.select(Some(0));
+                                                }
                                             }
-                                        } else if state.view == View::ModelSelect {
-                                            state.view = View::ProviderEdit;
                                         }
+                                        7 => {
+                                            if state.view == View::ProviderList {
+                                                if let Some(i) =
+                                                    state.provider_list_state.selected()
+                                                {
+                                                    if let Some(p) = state.providers.get(i) {
+                                                        let _ = self.tx_cmd.send(
+                                                            TuiCommand::DeleteProvider(
+                                                                p.id().clone(),
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                            } else if state.view == View::Dashboard {
+                                                if let Some(job_id) = &state.selected_job_id {
+                                                    let _ = self.tx_cmd.send(
+                                                        TuiCommand::DeleteJob(job_id.clone()),
+                                                    );
+                                                    state.selected_job_id = None;
+                                                }
+                                            }
+                                        }
+                                        8 => {
+                                            // F9 Back
+                                            if state.view == View::ProviderEdit {
+                                                let is_new =
+                                                    if let Some(p) = &state.editing_provider {
+                                                        !state
+                                                            .providers
+                                                            .iter()
+                                                            .any(|existing| existing.id() == p.id())
+                                                    } else {
+                                                        false
+                                                    };
+
+                                                if is_new {
+                                                    state.view = View::ProviderTypeSelect;
+                                                } else {
+                                                    state.view = View::ProviderList;
+                                                }
+                                            } else if state.view == View::ModelSelect {
+                                                state.view = View::ProviderEdit;
+                                            }
+                                        }
+                                        9 => return Ok(()), // F10 Quit
+                                        10 => {
+                                            // F11 Settings
+                                            state.view = View::Settings;
+                                            state.focus = FocusArea::Main;
+                                        }
+                                        11 => {
+                                            // F12 Prov
+                                            state.view = View::ProviderList;
+                                            state.focus = FocusArea::Main;
+                                        }
+                                        _ => {}
                                     }
-                                    9 => return Ok(()), // F10 Quit
-                                    10 => {
-                                        // F11 Settings
-                                        state.view = View::Settings;
-                                        state.focus = FocusArea::Main;
-                                    }
-                                    11 => {
-                                        // F12 Prov
-                                        state.view = View::ProviderList;
-                                        state.focus = FocusArea::Main;
-                                    }
-                                    _ => {}
-                                },
+                                }
                                 _ => {}
                             }
                             continue;
@@ -895,25 +1055,33 @@ impl Tui {
                                         state.view = View::ModelSelect;
                                         state.model_search_query.clear();
                                         state.update_filtered_models();
-                                    } else {
-                                        if let Some(p) = &state.editing_provider {
-                                            let _ =
-                                                self.tx_cmd.send(TuiCommand::SaveProvider(p.clone()));
-                                            state.view = View::ProviderList;
-                                        }
+                                    } else if let Some(p) = &state.editing_provider {
+                                        let _ =
+                                            self.tx_cmd.send(TuiCommand::SaveProvider(p.clone()));
+                                        state.view = View::ProviderList;
                                     }
                                 }
                                 KeyCode::Char(c) => {
                                     if state.edit_field_index != 3 {
                                         if let Some(p) = &mut state.editing_provider {
-                                            update_provider_field(p, state.edit_field_index, c, false);
+                                            update_provider_field(
+                                                p,
+                                                state.edit_field_index,
+                                                c,
+                                                false,
+                                            );
                                         }
                                     }
                                 }
                                 KeyCode::Backspace => {
                                     if state.edit_field_index != 3 {
                                         if let Some(p) = &mut state.editing_provider {
-                                            update_provider_field(p, state.edit_field_index, ' ', true);
+                                            update_provider_field(
+                                                p,
+                                                state.edit_field_index,
+                                                ' ',
+                                                true,
+                                            );
                                         }
                                     }
                                 }
@@ -926,17 +1094,18 @@ impl Tui {
                             match key.code {
                                 KeyCode::Esc | KeyCode::F(10) => state.view = View::Dashboard,
                                 KeyCode::Tab => {
-                                    state.job_create_field_idx = (state.job_create_field_idx + 1) % 3;
+                                    state.job_create_field_idx =
+                                        (state.job_create_field_idx + 1) % 4;
                                 }
                                 KeyCode::BackTab => {
                                     if state.job_create_field_idx == 0 {
-                                        state.job_create_field_idx = 2;
+                                        state.job_create_field_idx = 3;
                                     } else {
                                         state.job_create_field_idx -= 1;
                                     }
                                 }
                                 KeyCode::Up => {
-                                    if state.job_create_field_idx == 2 {
+                                    if state.job_create_field_idx == 3 {
                                         let i = match state.job_create_template_state.selected() {
                                             Some(i) => {
                                                 if i == 0 {
@@ -953,7 +1122,7 @@ impl Tui {
                                     }
                                 }
                                 KeyCode::Down => {
-                                    if state.job_create_field_idx == 2 {
+                                    if state.job_create_field_idx == 3 {
                                         let i = match state.job_create_template_state.selected() {
                                             Some(i) => {
                                                 if i >= state.templates.len().saturating_sub(1) {
@@ -974,6 +1143,9 @@ impl Tui {
                                         state.job_create_name.push(c);
                                     } else if state.job_create_field_idx == 1 {
                                         state.job_create_domain.push(c);
+                                    } else if state.job_create_field_idx == 2 && c.is_ascii_digit()
+                                    {
+                                        state.job_create_samples.push(c);
                                     }
                                 }
                                 KeyCode::Backspace => {
@@ -981,12 +1153,12 @@ impl Tui {
                                         state.job_create_name.pop();
                                     } else if state.job_create_field_idx == 1 {
                                         state.job_create_domain.pop();
+                                    } else if state.job_create_field_idx == 2 {
+                                        state.job_create_samples.pop();
                                     }
                                 }
                                 KeyCode::F(2) => {
-                                    if !state.job_create_name.is_empty() && !state.job_create_domain.is_empty() {
-                                        // Handled by common handler
-                                    }
+                                    // Handled by common handler, but we need to ensure validation passes
                                 }
                                 _ => {}
                             }
@@ -1063,7 +1235,9 @@ impl Tui {
                                 }
                                 KeyCode::Tab => state.focus = FocusArea::BottomBar,
                                 KeyCode::Enter => {
-                                    let model_to_use = if let Some(selected_idx) = state.model_list_state.selected() {
+                                    let model_to_use = if let Some(selected_idx) =
+                                        state.model_list_state.selected()
+                                    {
                                         state.filtered_models.get(selected_idx).cloned()
                                     } else if !state.model_search_query.is_empty() {
                                         Some(state.model_search_query.clone())
@@ -1199,15 +1373,16 @@ impl Tui {
                             KeyCode::Char('h') => state.show_help = !state.show_help,
                             KeyCode::Char('s') => state.view = View::Settings,
                             KeyCode::Char('d') => {
-                                if let Some(job_id) = &state.selected_job_id {
+                                if let Some(job_id) = state.selected_job_id_or_highlighted() {
                                     let _ = self.tx_cmd.send(TuiCommand::DeleteJob(job_id.clone()));
                                     state.view = View::Dashboard;
                                     state.selected_job_id = None;
                                 }
                             }
                             KeyCode::Char('p') => {
-                                if let Some(job_id) = &state.selected_job_id {
-                                    if let Some(job) = state.jobs.iter().find(|j| &j.id == job_id) {
+                                if let Some(job_id) = state.selected_job_id_or_highlighted() {
+                                    state.selected_job_id = Some(job_id.clone());
+                                    if let Some(job) = state.jobs.iter().find(|j| j.id == job_id) {
                                         match job.status {
                                             destilation_core::domain::JobStatus::Running => {
                                                 let _ = self
@@ -1527,7 +1702,7 @@ fn render_provider_edit(f: &mut Frame, area: Rect, state: &mut TuiState) {
             )
             .split(area);
 
-        let fields = vec![
+        let fields = [
             ("Name", name),
             ("Base URL / Command", base_url),
             ("API Key", api_key),
@@ -1554,7 +1729,7 @@ fn render_provider_edit(f: &mut Frame, area: Rect, state: &mut TuiState) {
                     format!("{} (Press <Enter> to Change)", value)
                 }
             } else {
-                format!("{}", value)
+                value.to_string()
             };
 
             let p = Paragraph::new(display_value).block(
@@ -1638,11 +1813,34 @@ fn render_model_select(f: &mut Frame, area: Rect, state: &mut TuiState) {
 fn render_dashboard(f: &mut Frame, area: Rect, snap: &MetricsSnapshot, state: &mut TuiState) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)].as_ref())
         .split(area);
+
+    let right_chunks = if state.show_logs {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(
+                [
+                    Constraint::Percentage(50),
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(25),
+                ]
+                .as_ref(),
+            )
+            .split(chunks[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)].as_ref())
+            .split(chunks[1])
+    };
 
     let active_providers = state.providers.iter().filter(|p| p.is_enabled()).count();
     let total_providers = state.providers.len();
+
+    let elapsed = state.started_at.elapsed().as_secs_f64().max(0.001);
+    let samples_per_min = snap.samples_persisted as f64 / elapsed * 60.0;
+    let tasks_per_min = snap.tasks_persisted as f64 / elapsed * 60.0;
 
     let stats_text = vec![
         Line::from(vec![
@@ -1654,46 +1852,55 @@ fn render_dashboard(f: &mut Frame, area: Rect, snap: &MetricsSnapshot, state: &m
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(""),
         Line::from(vec![
-            Span::raw("Jobs: "),
+            Span::raw("Samples Saved: "),
             Span::styled(
-                format!("{}", snap.jobs_submitted),
+                format!("{}", snap.samples_persisted),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("Validator: "),
+            Span::styled(
+                format!("pass={} fail={}", snap.validator_pass, snap.validator_fail),
                 Style::default().fg(Color::Yellow),
             ),
-            Span::raw(" | Tasks: "),
+        ]),
+        Line::from(vec![
+            Span::raw("Throughput: "),
             Span::styled(
-                format!("{}", snap.tasks_enqueued),
+                format!("{:.1} samples/min", samples_per_min),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("Tasks: "),
+            Span::styled(
+                format!(
+                    "enq={} started={} saved={} rej={}",
+                    snap.tasks_enqueued,
+                    snap.tasks_started,
+                    snap.tasks_persisted,
+                    snap.tasks_rejected
+                ),
                 Style::default().fg(Color::Blue),
             ),
         ]),
         Line::from(vec![
-            Span::raw("Started: "),
+            Span::raw("Agent Rate: "),
             Span::styled(
-                format!("{}", snap.tasks_started),
-                Style::default().fg(Color::Magenta),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("Persisted: "),
-            Span::styled(
-                format!("{}", snap.tasks_persisted),
-                Style::default().fg(Color::Green),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("Rejected: "),
-            Span::styled(
-                format!("{}", snap.tasks_rejected),
-                Style::default().fg(Color::Red),
+                format!("{:.1} saved-tasks/min", tasks_per_min),
+                Style::default().fg(Color::Cyan),
             ),
         ]),
     ];
-    let stats = Paragraph::new(stats_text).block(
-        Block::default()
-            .title("Global Metrics")
-            .borders(Borders::ALL),
-    );
+
+    let stats =
+        Paragraph::new(stats_text).block(Block::default().title("Execution").borders(Borders::ALL));
     f.render_widget(stats, chunks[0]);
 
     let items: Vec<ListItem> = state
@@ -1704,25 +1911,236 @@ fn render_dashboard(f: &mut Frame, area: Rect, snap: &MetricsSnapshot, state: &m
                 destilation_core::domain::JobStatus::Completed => Style::default().fg(Color::Green),
                 destilation_core::domain::JobStatus::Failed => Style::default().fg(Color::Red),
                 destilation_core::domain::JobStatus::Running => Style::default().fg(Color::Yellow),
+                destilation_core::domain::JobStatus::Paused => Style::default().fg(Color::Cyan),
                 _ => Style::default(),
             };
+
+            let tasks = state
+                .tasks
+                .get(&job.id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let saved = tasks
+                .iter()
+                .filter(|t| t.state == destilation_core::domain::TaskState::Persisted)
+                .count() as u64;
+            let rejected = tasks
+                .iter()
+                .filter(|t| t.state == destilation_core::domain::TaskState::Rejected)
+                .count() as u64;
+            let received = tasks.iter().filter(|t| t.raw_response.is_some()).count() as u64;
+            let target = job.config.target_samples;
+
+            let job_start = job.started_at.unwrap_or(job.created_at);
+            let job_elapsed =
+                (chrono::Utc::now() - job_start).num_milliseconds().max(1) as f64 / 1000.0;
+            let job_rate = saved as f64 / job_elapsed * 60.0;
+            let remaining = target.saturating_sub(saved);
+            let eta_secs = if job_rate > 0.0 {
+                (remaining as f64) / (job_rate / 60.0)
+            } else {
+                f64::INFINITY
+            };
+
+            let eta_str = if eta_secs.is_finite() && eta_secs > 0.0 {
+                format!("ETA {:.0}s", eta_secs)
+            } else {
+                "ETA --".to_string()
+            };
+
             ListItem::new(Line::from(vec![
-                Span::styled(format!("[{}] ", job.id), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(
+                        "[{}] ",
+                        if job.id.len() > 8 {
+                            &job.id[job.id.len() - 8..]
+                        } else {
+                            &job.id
+                        }
+                    ),
+                    Style::default().fg(Color::Cyan),
+                ),
                 Span::styled(format!("{:?}", job.status), status_style),
                 Span::raw(format!(
-                    " - {} (Template: {})",
-                    job.config.name, job.config.template_id
+                    " {} | {}/{} saved | {} recv | {} rej | {:.1}/min | {}",
+                    job.config.name, saved, target, received, rejected, job_rate, eta_str
                 )),
             ]))
         })
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().title("Active Jobs").borders(Borders::ALL))
+        .block(Block::default().title("Jobs").borders(Borders::ALL))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol(">> ");
 
-    f.render_stateful_widget(list, chunks[1], &mut state.job_list_state);
+    f.render_stateful_widget(list, right_chunks[0], &mut state.job_list_state);
+
+    let selected_id = state.selected_job_id_or_highlighted();
+    let selected_job = selected_id
+        .as_ref()
+        .and_then(|id| state.jobs.iter().find(|j| &j.id == id));
+
+    let mut detail_lines: Vec<Line> = Vec::new();
+    if let Some(job) = selected_job {
+        let tasks = state
+            .tasks
+            .get(&job.id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let received = tasks.iter().filter(|t| t.raw_response.is_some()).count() as u64;
+        let saved = tasks
+            .iter()
+            .filter(|t| t.state == destilation_core::domain::TaskState::Persisted)
+            .count() as u64;
+        let rejected = tasks
+            .iter()
+            .filter(|t| t.state == destilation_core::domain::TaskState::Rejected)
+            .count() as u64;
+        let generating = tasks
+            .iter()
+            .filter(|t| t.state == destilation_core::domain::TaskState::Generating)
+            .count() as u64;
+        let validating = tasks
+            .iter()
+            .filter(|t| t.state == destilation_core::domain::TaskState::Validating)
+            .count() as u64;
+        let queued = tasks
+            .iter()
+            .filter(|t| t.state == destilation_core::domain::TaskState::Queued)
+            .count() as u64;
+
+        let job_start = job.started_at.unwrap_or(job.created_at);
+        let job_elapsed_secs =
+            (chrono::Utc::now() - job_start).num_milliseconds().max(1) as f64 / 1000.0;
+        let job_rate = saved as f64 / job_elapsed_secs * 60.0;
+        let remaining = job.config.target_samples.saturating_sub(saved);
+        let eta_secs = if job_rate > 0.0 {
+            (remaining as f64) / (job_rate / 60.0)
+        } else {
+            f64::INFINITY
+        };
+
+        let eta_str = if eta_secs.is_finite() && eta_secs > 0.0 {
+            format!("{:.0}s", eta_secs)
+        } else {
+            "--".to_string()
+        };
+
+        let last_error = tasks
+            .iter()
+            .filter(|t| t.state == destilation_core::domain::TaskState::Rejected)
+            .filter_map(|t| t.validation_result.as_ref())
+            .flat_map(|vr| vr.issues.iter().map(|i| i.code.clone()))
+            .next()
+            .unwrap_or_else(|| "none".to_string());
+
+        detail_lines.push(Line::from(vec![
+            Span::raw("Selected: "),
+            Span::styled(
+                &job.config.name,
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        detail_lines.push(Line::from(vec![
+            Span::raw("Status: "),
+            Span::raw(format!("{:?}", job.status)),
+            Span::raw(" | Started: "),
+            Span::raw(job_start.to_rfc3339()),
+        ]));
+        detail_lines.push(Line::from(vec![
+            Span::raw("Received: "),
+            Span::styled(format!("{}", received), Style::default().fg(Color::Yellow)),
+            Span::raw(" | Saved: "),
+            Span::styled(
+                format!("{}/{}", saved, job.config.target_samples),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw(" | Rejected: "),
+            Span::styled(format!("{}", rejected), Style::default().fg(Color::Red)),
+        ]));
+        detail_lines.push(Line::from(vec![
+            Span::raw("In-flight: "),
+            Span::styled(
+                format!("gen={} val={} queued={}", generating, validating, queued),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+        detail_lines.push(Line::from(vec![
+            Span::raw("Throughput: "),
+            Span::styled(
+                format!("{:.2} samples/min", job_rate),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::raw(" | ETA: "),
+            Span::styled(eta_str, Style::default().fg(Color::Cyan)),
+        ]));
+        detail_lines.push(Line::from(vec![
+            Span::raw("Last Error: "),
+            Span::styled(last_error, Style::default().fg(Color::Red)),
+        ]));
+    } else {
+        detail_lines.push(Line::from("No job selected"));
+    }
+
+    let detail = Paragraph::new(detail_lines)
+        .block(Block::default().title("Selected Job").borders(Borders::ALL));
+    f.render_widget(detail, right_chunks[1]);
+
+    if state.show_logs {
+        let selected_id = state.selected_job_id_or_highlighted();
+        let title = if let Some(id) = selected_id.as_ref() {
+            format!(
+                "Logs ({})",
+                if id.len() > 8 {
+                    &id[id.len() - 8..]
+                } else {
+                    id
+                }
+            )
+        } else {
+            "Logs".to_string()
+        };
+
+        let max_lines = right_chunks[2].height.saturating_sub(2) as usize;
+        let lines = if let Some(id) = selected_id.as_ref() {
+            let buf = state.job_logs.get(id).map(|v| v.as_slice()).unwrap_or(&[]);
+            let start = buf.len().saturating_sub(max_lines.max(1));
+            buf[start..]
+                .iter()
+                .map(|ev| {
+                    let ts = ev.ts.format("%H:%M:%S").to_string();
+                    let lvl = match ev.level {
+                        destilation_core::logging::LogLevel::Trace => "TRACE",
+                        destilation_core::logging::LogLevel::Debug => "DEBUG",
+                        destilation_core::logging::LogLevel::Info => "INFO",
+                        destilation_core::logging::LogLevel::Warn => "WARN",
+                        destilation_core::logging::LogLevel::Error => "ERROR",
+                    };
+                    let mut msg = format!("{} {} {}", ts, lvl, ev.message);
+                    if let Some(task_id) = ev.task_id.as_ref() {
+                        if task_id.len() > 8 {
+                            msg.push_str(&format!(" [{}]", &task_id[task_id.len() - 8..]));
+                        } else {
+                            msg.push_str(&format!(" [{}]", task_id));
+                        }
+                    }
+                    Line::from(msg)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![Line::from("No job selected")]
+        };
+
+        let lines = if lines.is_empty() {
+            vec![Line::from("No log events yet")]
+        } else {
+            lines
+        };
+
+        let logs = Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL));
+        f.render_widget(logs, right_chunks[2]);
+    }
 }
 
 fn render_job_detail(f: &mut Frame, area: Rect, state: &TuiState) {
@@ -1870,6 +2288,7 @@ fn render_job_create(f: &mut Frame, area: Rect, state: &mut TuiState) {
             [
                 Constraint::Length(3), // Name
                 Constraint::Length(3), // Domain/Subject
+                Constraint::Length(3), // Samples
                 Constraint::Min(5),    // Template List
             ]
             .as_ref(),
@@ -1910,8 +2329,25 @@ fn render_job_create(f: &mut Frame, area: Rect, state: &mut TuiState) {
     );
     f.render_widget(domain_input, chunks[1]);
 
+    // Samples Input
+    let samples_style = if state.job_create_field_idx == 2 {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
+    let samples_input = Paragraph::new(state.job_create_samples.as_str()).block(
+        Block::default()
+            .title("Target Samples (e.g., 100)")
+            .borders(Borders::ALL)
+            .border_style(samples_style),
+    );
+    f.render_widget(samples_input, chunks[2]);
+
     // Template Selection
-    let template_style = if state.job_create_field_idx == 2 {
+    let template_style = if state.job_create_field_idx == 3 {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
@@ -1934,7 +2370,7 @@ fn render_job_create(f: &mut Frame, area: Rect, state: &mut TuiState) {
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-    f.render_stateful_widget(list, chunks[2], &mut state.job_create_template_state);
+    f.render_stateful_widget(list, chunks[3], &mut state.job_create_template_state);
 }
 
 fn render_provider_type_select(f: &mut Frame, area: Rect, state: &TuiState) {
@@ -1945,7 +2381,11 @@ fn render_provider_type_select(f: &mut Frame, area: Rect, state: &TuiState) {
         ListItem::new("Script"),
     ];
     let list = List::new(items)
-        .block(Block::default().title("Select Provider Type").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Select Provider Type")
+                .borders(Borders::ALL),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     let mut list_state = ListState::default();
@@ -1963,7 +2403,7 @@ fn get_f_keys(view: View) -> Vec<(&'static str, &'static str)> {
             ("F3", "View"),
             ("F4", ""),
             ("F5", ""),
-            ("F6", ""),
+            ("F6", "Logs"),
             ("F7", "New"),
             ("F8", "Del"),
             ("F9", ""),
@@ -2055,5 +2495,53 @@ fn get_f_keys(view: View) -> Vec<(&'static str, &'static str)> {
             ("F11", "Set"),
             ("F12", "Prov"),
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use destilation_core::storage::JobStore;
+
+    fn mk_job(id: &str) -> destilation_core::domain::Job {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = destilation_core::storage::InMemoryJobStore::new();
+        let config = destilation_core::domain::JobConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            target_samples: 1,
+            max_concurrency: 1,
+            domains: vec![],
+            template_id: "t".to_string(),
+            reasoning_mode: destilation_core::domain::ReasoningMode::Simple,
+            providers: vec![],
+            validation: destilation_core::domain::JobValidationConfig {
+                max_attempts: 1,
+                validators: vec![],
+                min_quality_score: None,
+                fail_fast: false,
+            },
+            output: destilation_core::domain::JobOutputConfig {
+                dataset_dir: ".".to_string(),
+                shard_size: 1,
+                compress: false,
+                metadata: Default::default(),
+            },
+        };
+        rt.block_on(async { store.create_job(config).await.unwrap() })
+    }
+
+    #[test]
+    fn dashboard_selection_sets_selected_job_id() {
+        let mut s = TuiState::new();
+        s.jobs = vec![mk_job("a"), mk_job("b")];
+        s.job_list_state.select(Some(0));
+        s.sync_selected_job_id();
+        assert_eq!(s.selected_job_id.as_deref(), Some("a"));
+        s.next_job();
+        assert_eq!(s.selected_job_id.as_deref(), Some("b"));
+        s.previous_job();
+        assert_eq!(s.selected_job_id.as_deref(), Some("a"));
     }
 }

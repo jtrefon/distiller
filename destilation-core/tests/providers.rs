@@ -1,6 +1,5 @@
 use destilation_core::provider::ModelProvider;
 use destilation_core::providers::{OllamaProvider, OpenRouterProvider};
-use std::collections::HashMap;
 
 #[test]
 fn openrouter_provider_metadata() {

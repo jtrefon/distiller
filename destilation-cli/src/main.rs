@@ -5,6 +5,7 @@ use destilation_core::domain::{
     DomainSpec, JobConfig, JobOutputConfig, JobProviderSpec, JobValidationConfig, ReasoningMode,
     TemplateConfig, TemplateId, TemplateMode, TemplateSchema, TemplateSchemaField,
 };
+use destilation_core::logging::BufferedFileEventLogger;
 use destilation_core::metrics::{InMemoryMetrics, Metrics};
 use destilation_core::orchestrator::Orchestrator;
 use destilation_core::storage::{
@@ -131,8 +132,7 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
 
     let (job_store, task_store): (Arc<dyn JobStore>, Arc<dyn TaskStore>) =
         if let Some(url) = database_url {
-            let options = SqliteConnectOptions::from_str(&url)?
-                .create_if_missing(true);
+            let options = SqliteConnectOptions::from_str(&url)?.create_if_missing(true);
             let pool = SqlitePool::connect_with(options).await?;
             let js = SqliteJobStore::new(pool.clone());
             js.init().await?;
@@ -335,9 +335,7 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
         if let Some(jobs) = gc.as_ref().and_then(|g| g.jobs.as_ref()) {
             if let Some(job) = jobs.first() {
                 (
-                    job.id
-                        .clone()
-                        .unwrap_or_else(|| default_id.clone()),
+                    job.id.clone().unwrap_or_else(|| default_id.clone()),
                     job.name
                         .clone()
                         .unwrap_or_else(|| "Default Job".to_string()),
@@ -375,6 +373,8 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
     let providers_arc = Arc::new(tokio::sync::RwLock::new(providers));
     let provider_configs_arc = Arc::new(tokio::sync::RwLock::new(provider_configs));
 
+    let event_logger = Arc::new(BufferedFileEventLogger::new(2000, 500));
+
     let orchestrator = Orchestrator {
         job_store,
         task_store,
@@ -384,6 +384,7 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
         validators,
         dataset_writer,
         metrics: metrics.clone(),
+        logger: event_logger.clone(),
     };
 
     let dataset_dir = format!("{dataset_root}/{job_id}");
@@ -427,7 +428,9 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let _ = tx.send(TuiUpdate::Templates(templates.values().cloned().collect()));
     let orchestrator_monitor = orchestrator.clone();
+    let event_logger_monitor = event_logger.clone();
     tokio::spawn(async move {
+        let mut last_seq: u64 = 0;
         loop {
             if let Ok(jobs) = orchestrator_monitor.job_store.list_jobs().await {
                 let _ = tx.send(TuiUpdate::Jobs(jobs.clone()));
@@ -440,6 +443,12 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
             // Send provider updates
             let providers = orchestrator_monitor.list_providers().await;
             let _ = tx.send(TuiUpdate::Providers(providers));
+
+            let (new_last, events) = event_logger_monitor.events_since(last_seq);
+            last_seq = new_last;
+            if !events.is_empty() {
+                let _ = tx.send(TuiUpdate::LogEvents(events));
+            }
 
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
@@ -455,7 +464,21 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
                         let _ = orchestrator_cmd.pause_job(&id).await;
                     }
                     TuiCommand::ResumeJob(id) => {
+                        let was_pending = orchestrator_cmd
+                            .job_store
+                            .get_job(&id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|j| j.status == destilation_core::domain::JobStatus::Pending)
+                            .unwrap_or(false);
                         let _ = orchestrator_cmd.resume_job(&id).await;
+                        if was_pending {
+                            let runner = orchestrator_cmd.clone();
+                            tokio::spawn(async move {
+                                let _ = runner.run_job(&id).await;
+                            });
+                        }
                     }
                     TuiCommand::DeleteJob(id) => {
                         let _ = orchestrator_cmd.delete_job(&id).await;
@@ -470,7 +493,13 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
                         orchestrator_cmd.delete_provider(&id).await;
                     }
                     TuiCommand::StartJob(config) => {
-                        let _ = orchestrator_cmd.submit_job(config).await;
+                        if let Ok(job) = orchestrator_cmd.submit_job(config).await {
+                            let job_id = job.id.clone();
+                            let runner = orchestrator_cmd.clone();
+                            tokio::spawn(async move {
+                                let _ = runner.run_job(&job_id).await;
+                            });
+                        }
                     }
                 }
             }
@@ -478,7 +507,7 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
         }
     });
 
-    let mut tui = Tui::new(metrics_clone, rx, tx_cmd);
+    let mut tui = Tui::new(metrics_clone, rx, tx_cmd, dataset_root.clone());
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let done_clone = done.clone();
     tokio::spawn(async move {

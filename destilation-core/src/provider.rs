@@ -46,6 +46,8 @@ pub struct GenerationResult {
 pub enum ProviderError {
     #[error("transport error")]
     Transport,
+    #[error("request timed out")]
+    Timeout,
     #[error("rate limited")]
     RateLimited,
     #[error("invalid response")]

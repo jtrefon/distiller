@@ -1,6 +1,7 @@
 use destilation_core::domain::{
     DomainSpec, JobConfig, JobOutputConfig, JobProviderSpec, JobValidationConfig, ReasoningMode,
 };
+use destilation_core::logging::NoopEventLogger;
 use destilation_core::metrics::InMemoryMetrics;
 use destilation_core::orchestrator::Orchestrator;
 use destilation_core::provider::{
@@ -140,6 +141,7 @@ async fn select_provider_respects_capabilities() {
         validators: Vec::new(),
         dataset_writer: Arc::new(DummyStore),
         metrics: Arc::new(InMemoryMetrics::new()),
+        logger: Arc::new(NoopEventLogger),
     };
     let job = JobConfig {
         id: "job".to_string(),

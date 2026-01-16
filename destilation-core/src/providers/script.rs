@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -83,10 +84,17 @@ impl ModelProvider for ScriptProvider {
         drop(child.stdin.take());
 
         let start = std::time::Instant::now();
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|_| ProviderError::Transport)?;
+        let output = if let Some(timeout_ms) = self.config.timeout_ms {
+            tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
+                .await
+                .map_err(|_| ProviderError::Timeout)?
+                .map_err(|_| ProviderError::Transport)?
+        } else {
+            child
+                .wait_with_output()
+                .await
+                .map_err(|_| ProviderError::Transport)?
+        };
 
         if !output.status.success() {
             return Err(ProviderError::InvalidResponse);

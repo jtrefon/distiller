@@ -5,6 +5,7 @@ use crate::provider::{
 use async_trait::async_trait;
 use reqwest::Client;
 use std::collections::HashMap;
+use std::time::Duration;
 
 pub struct OpenRouterProvider {
     id: ProviderId,
@@ -17,10 +18,15 @@ pub struct OpenRouterProvider {
 
 impl OpenRouterProvider {
     pub fn new(id: ProviderId, base_url: String, api_key: String, model: String) -> Self {
+        let client = reqwest::ClientBuilder::new()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
             id,
             name: "OpenRouterProvider".to_string(),
-            client: Client::new(),
+            client,
             base_url,
             api_key,
             model,
@@ -97,7 +103,13 @@ impl ModelProvider for OpenRouterProvider {
             .json(&payload)
             .send()
             .await
-            .map_err(|_| ProviderError::Transport)?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Transport
+                }
+            })?;
 
         if !resp.status().is_success() {
             return Err(ProviderError::InvalidResponse);

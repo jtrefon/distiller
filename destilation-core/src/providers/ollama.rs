@@ -5,6 +5,7 @@ use crate::provider::{
 use async_trait::async_trait;
 use reqwest::Client;
 use std::collections::HashMap;
+use std::time::Duration;
 
 pub struct OllamaProvider {
     id: ProviderId,
@@ -16,10 +17,15 @@ pub struct OllamaProvider {
 
 impl OllamaProvider {
     pub fn new(id: ProviderId, base_url: String, model: String) -> Self {
+        let client = reqwest::ClientBuilder::new()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
             id,
             name: "OllamaProvider".to_string(),
-            client: Client::new(),
+            client,
             base_url,
             model,
         }
@@ -58,7 +64,13 @@ impl ModelProvider for OllamaProvider {
             .json(&payload)
             .send()
             .await
-            .map_err(|_| ProviderError::Transport)?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ProviderError::Timeout
+                } else {
+                    ProviderError::Transport
+                }
+            })?;
 
         if !resp.status().is_success() {
             return Err(ProviderError::InvalidResponse);
@@ -81,12 +93,13 @@ impl ModelProvider for OllamaProvider {
 
     async fn health_check(&self) -> Result<(), ProviderError> {
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|_| ProviderError::Transport)?;
+        let resp = self.client.get(url).send().await.map_err(|e| {
+            if e.is_timeout() {
+                ProviderError::Timeout
+            } else {
+                ProviderError::Transport
+            }
+        })?;
         if resp.status().is_success() {
             Ok(())
         } else {

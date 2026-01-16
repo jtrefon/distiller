@@ -18,3 +18,4 @@ serde = { version = "1.0", features = ["derive"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 ratatui = "0.30.0"
 crossterm = "0.29.0"
+chrono = "0.4"

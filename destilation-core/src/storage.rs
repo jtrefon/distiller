@@ -58,7 +58,9 @@ impl JobStore for InMemoryJobStore {
             config,
             status: JobStatus::Pending,
             created_at: chrono::Utc::now(),
+            started_at: None,
             updated_at: chrono::Utc::now(),
+            finished_at: None,
             completed_samples: 0,
         };
         self.inner
@@ -166,8 +168,8 @@ impl FilesystemDatasetWriter {
 #[async_trait]
 impl DatasetWriter for FilesystemDatasetWriter {
     async fn persist_sample(&self, sample: Sample) -> anyhow::Result<()> {
-        let dir = std::path::Path::new(&self.root);
-        std::fs::create_dir_all(dir)?;
+        let dir = std::path::Path::new(&self.root).join(&sample.job_id);
+        std::fs::create_dir_all(&dir)?;
         let path = dir.join("samples.jsonl");
         let line = serde_json::to_string(&sample)? + "\n";
         std::fs::OpenOptions::new()
@@ -202,13 +204,40 @@ impl SqliteJobStore {
                 config TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                started_at TEXT,
                 updated_at TEXT NOT NULL,
+                finished_at TEXT,
                 completed_samples INTEGER NOT NULL
             )
             "#,
         )
         .execute(&self.pool)
         .await?;
+
+        let cols = sqlx::query("PRAGMA table_info(jobs)")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut has_started_at = false;
+        let mut has_finished_at = false;
+        for row in cols {
+            let name: String = row.get("name");
+            if name == "started_at" {
+                has_started_at = true;
+            }
+            if name == "finished_at" {
+                has_finished_at = true;
+            }
+        }
+        if !has_started_at {
+            sqlx::query("ALTER TABLE jobs ADD COLUMN started_at TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
+        if !has_finished_at {
+            sqlx::query("ALTER TABLE jobs ADD COLUMN finished_at TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 }
@@ -221,26 +250,32 @@ impl JobStore for SqliteJobStore {
             config: config.clone(),
             status: JobStatus::Pending,
             created_at: chrono::Utc::now(),
+            started_at: None,
             updated_at: chrono::Utc::now(),
+            finished_at: None,
             completed_samples: 0,
         };
 
         let config_json = serde_json::to_string(&job.config)?;
         let status_str = serde_json::to_string(&job.status)?;
         let created_at = job.created_at.to_rfc3339();
+        let started_at: Option<String> = job.started_at.map(|t| t.to_rfc3339());
         let updated_at = job.updated_at.to_rfc3339();
+        let finished_at: Option<String> = job.finished_at.map(|t| t.to_rfc3339());
 
         sqlx::query(
             r#"
-            INSERT INTO jobs (id, config, status, created_at, updated_at, completed_samples)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs (id, config, status, created_at, started_at, updated_at, finished_at, completed_samples)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&job.id)
         .bind(config_json)
         .bind(status_str)
         .bind(created_at)
+        .bind(started_at)
         .bind(updated_at)
+        .bind(finished_at)
         .bind(job.completed_samples as i64)
         .execute(&self.pool)
         .await?;
@@ -258,22 +293,36 @@ impl JobStore for SqliteJobStore {
             let config_json: String = row.get("config");
             let status_str: String = row.get("status");
             let created_at_str: String = row.get("created_at");
+            let started_at_str: Option<String> = row.try_get("started_at").unwrap_or(None);
             let updated_at_str: String = row.get("updated_at");
+            let finished_at_str: Option<String> = row.try_get("finished_at").unwrap_or(None);
             let completed_samples: i64 = row.get("completed_samples");
 
             let config = serde_json::from_str(&config_json)?;
             let status = serde_json::from_str(&status_str)?;
             let created_at =
                 chrono::DateTime::parse_from_rfc3339(&created_at_str)?.with_timezone(&chrono::Utc);
+            let started_at = if let Some(s) = started_at_str {
+                Some(chrono::DateTime::parse_from_rfc3339(&s)?.with_timezone(&chrono::Utc))
+            } else {
+                None
+            };
             let updated_at =
                 chrono::DateTime::parse_from_rfc3339(&updated_at_str)?.with_timezone(&chrono::Utc);
+            let finished_at = if let Some(s) = finished_at_str {
+                Some(chrono::DateTime::parse_from_rfc3339(&s)?.with_timezone(&chrono::Utc))
+            } else {
+                None
+            };
 
             Ok(Some(Job {
                 id: id.clone(),
                 config,
                 status,
                 created_at,
+                started_at,
                 updated_at,
+                finished_at,
                 completed_samples: completed_samples as u64,
             }))
         } else {
@@ -285,17 +334,21 @@ impl JobStore for SqliteJobStore {
         let config_json = serde_json::to_string(&job.config)?;
         let status_str = serde_json::to_string(&job.status)?;
         let updated_at = job.updated_at.to_rfc3339();
+        let started_at: Option<String> = job.started_at.map(|t| t.to_rfc3339());
+        let finished_at: Option<String> = job.finished_at.map(|t| t.to_rfc3339());
 
         sqlx::query(
             r#"
             UPDATE jobs
-            SET config = ?, status = ?, updated_at = ?, completed_samples = ?
+            SET config = ?, status = ?, started_at = ?, updated_at = ?, finished_at = ?, completed_samples = ?
             WHERE id = ?
             "#,
         )
         .bind(config_json)
         .bind(status_str)
+        .bind(started_at)
         .bind(updated_at)
+        .bind(finished_at)
         .bind(job.completed_samples as i64)
         .bind(&job.id)
         .execute(&self.pool)
@@ -314,22 +367,36 @@ impl JobStore for SqliteJobStore {
             let config_json: String = row.get("config");
             let status_str: String = row.get("status");
             let created_at_str: String = row.get("created_at");
+            let started_at_str: Option<String> = row.try_get("started_at").unwrap_or(None);
             let updated_at_str: String = row.get("updated_at");
+            let finished_at_str: Option<String> = row.try_get("finished_at").unwrap_or(None);
             let completed_samples: i64 = row.get("completed_samples");
 
             let config = serde_json::from_str(&config_json)?;
             let status = serde_json::from_str(&status_str)?;
             let created_at =
                 chrono::DateTime::parse_from_rfc3339(&created_at_str)?.with_timezone(&chrono::Utc);
+            let started_at = if let Some(s) = started_at_str {
+                Some(chrono::DateTime::parse_from_rfc3339(&s)?.with_timezone(&chrono::Utc))
+            } else {
+                None
+            };
             let updated_at =
                 chrono::DateTime::parse_from_rfc3339(&updated_at_str)?.with_timezone(&chrono::Utc);
+            let finished_at = if let Some(s) = finished_at_str {
+                Some(chrono::DateTime::parse_from_rfc3339(&s)?.with_timezone(&chrono::Utc))
+            } else {
+                None
+            };
 
             jobs.push(Job {
                 id,
                 config,
                 status,
                 created_at,
+                started_at,
                 updated_at,
+                finished_at,
                 completed_samples: completed_samples as u64,
             });
         }

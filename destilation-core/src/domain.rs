@@ -87,7 +87,9 @@ pub struct Job {
     pub config: JobConfig,
     pub status: JobStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
     pub completed_samples: u64,
 }
 
