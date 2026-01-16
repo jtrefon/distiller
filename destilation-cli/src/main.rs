@@ -9,11 +9,15 @@ use destilation_core::metrics::{InMemoryMetrics, Metrics};
 use destilation_core::orchestrator::Orchestrator;
 use destilation_core::providers::MockProvider;
 use destilation_core::providers::{OllamaProvider, OpenRouterProvider};
-use destilation_core::storage::{FilesystemDatasetWriter, InMemoryJobStore, InMemoryTaskStore};
+use destilation_core::storage::{
+    FilesystemDatasetWriter, InMemoryJobStore, InMemoryTaskStore, JobStore, SqliteJobStore,
+    SqliteTaskStore, TaskStore,
+};
 use destilation_core::validation::Validator;
 use destilation_core::validators::DedupValidator;
 use destilation_core::validators::SemanticDedupValidator;
 use destilation_core::validators::StructuralValidator;
+use sqlx::sqlite::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,6 +45,7 @@ struct GlobalConfig {
 struct RuntimeConfig {
     max_global_concurrency: Option<u32>,
     dataset_root: Option<String>,
+    database_url: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -108,9 +113,27 @@ fn load_global_config(path: Option<String>) -> Option<GlobalConfig> {
 }
 
 async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
-    let job_store = Arc::new(InMemoryJobStore::new());
-    let task_store = Arc::new(InMemoryTaskStore::new());
     let gc = load_global_config(config_path);
+
+    let database_url = gc
+        .as_ref()
+        .and_then(|g| g.runtime.as_ref().and_then(|r| r.database_url.clone()));
+
+    let (job_store, task_store): (Arc<dyn JobStore>, Arc<dyn TaskStore>) =
+        if let Some(url) = database_url {
+            let pool = SqlitePool::connect(&url).await?;
+            let js = SqliteJobStore::new(pool.clone());
+            js.init().await?;
+            let ts = SqliteTaskStore::new(pool);
+            ts.init().await?;
+            (Arc::new(js), Arc::new(ts))
+        } else {
+            (
+                Arc::new(InMemoryJobStore::new()),
+                Arc::new(InMemoryTaskStore::new()),
+            )
+        };
+
     let dataset_root = gc
         .as_ref()
         .and_then(|g| g.runtime.as_ref().and_then(|r| r.dataset_root.clone()))

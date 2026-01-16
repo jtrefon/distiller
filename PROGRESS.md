@@ -17,10 +17,9 @@
 - README with quick start, lint/test/build, config examples
 - Storage Refactoring: Decoupled storage interfaces (Ports & Adapters)
 - Storage Implementation: SQLite backend foundations (SqliteJobStore, SqliteTaskStore)
+- Storage Integration: Wiring SQLite backend into CLI configuration and startup logic
 
 ## In Progress
-
-- **Storage Integration**: Wiring SQLite backend into CLI configuration and startup logic.
 
 ## Upcoming (Phase 2)
 
