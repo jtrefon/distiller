@@ -15,8 +15,9 @@ use destilation_core::validation::Validator;
 use destilation_core::validators::DedupValidator;
 use destilation_core::validators::SemanticDedupValidator;
 use destilation_core::validators::StructuralValidator;
-use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -130,7 +131,9 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
 
     let (job_store, task_store): (Arc<dyn JobStore>, Arc<dyn TaskStore>) =
         if let Some(url) = database_url {
-            let pool = SqlitePool::connect(&url).await?;
+            let options = SqliteConnectOptions::from_str(&url)?
+                .create_if_missing(true);
+            let pool = SqlitePool::connect_with(options).await?;
             let js = SqliteJobStore::new(pool.clone());
             js.init().await?;
             let ts = SqliteTaskStore::new(pool);
@@ -322,13 +325,19 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
             .unwrap_or_else(|| TemplateId::from("simple_qa"))
     };
 
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let default_id = format!("job-default-{}", timestamp);
+
     let (job_id, job_name, job_desc, target_samples, max_concurrency, job_providers) =
         if let Some(jobs) = gc.as_ref().and_then(|g| g.jobs.as_ref()) {
             if let Some(job) = jobs.first() {
                 (
                     job.id
                         .clone()
-                        .unwrap_or_else(|| "job-default-001".to_string()),
+                        .unwrap_or_else(|| default_id.clone()),
                     job.name
                         .clone()
                         .unwrap_or_else(|| "Default Job".to_string()),
@@ -341,7 +350,7 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
                 )
             } else {
                 (
-                    "job-default-001".to_string(),
+                    default_id.clone(),
                     "Default Job".to_string(),
                     Some("Default distillation job".to_string()),
                     3,
@@ -351,7 +360,7 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
             }
         } else {
             (
-                "job-default-001".to_string(),
+                default_id.clone(),
                 "Default Job".to_string(),
                 Some("Default distillation job".to_string()),
                 3,
@@ -361,7 +370,7 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
         };
 
     let metrics = Arc::new(InMemoryMetrics::new());
-    
+
     // Create Arc<RwLock> wrappers for orchestrator
     let providers_arc = Arc::new(tokio::sync::RwLock::new(providers));
     let provider_configs_arc = Arc::new(tokio::sync::RwLock::new(provider_configs));
@@ -371,7 +380,7 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
         task_store,
         providers: providers_arc,
         provider_configs: provider_configs_arc,
-        templates,
+        templates: templates.clone(),
         validators,
         dataset_writer,
         metrics: metrics.clone(),
@@ -416,6 +425,7 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
     let handle = tokio::spawn(async move { orchestrator_clone.run_job(&job_id).await });
 
     let (tx, rx) = std::sync::mpsc::channel();
+    let _ = tx.send(TuiUpdate::Templates(templates.values().cloned().collect()));
     let orchestrator_monitor = orchestrator.clone();
     tokio::spawn(async move {
         loop {
@@ -430,7 +440,7 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
             // Send provider updates
             let providers = orchestrator_monitor.list_providers().await;
             let _ = tx.send(TuiUpdate::Providers(providers));
-            
+
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     });
@@ -441,12 +451,27 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
         loop {
             while let Ok(cmd) = rx_cmd.try_recv() {
                 match cmd {
-                    TuiCommand::PauseJob(id) => { let _ = orchestrator_cmd.pause_job(&id).await; },
-                    TuiCommand::ResumeJob(id) => { let _ = orchestrator_cmd.resume_job(&id).await; },
-                    TuiCommand::DeleteJob(id) => { let _ = orchestrator_cmd.delete_job(&id).await; },
-                    TuiCommand::CleanDatabase => { let _ = orchestrator_cmd.clean_database().await; },
-                    TuiCommand::SaveProvider(config) => { orchestrator_cmd.save_provider(config).await; },
-                    TuiCommand::DeleteProvider(id) => { orchestrator_cmd.delete_provider(&id).await; },
+                    TuiCommand::PauseJob(id) => {
+                        let _ = orchestrator_cmd.pause_job(&id).await;
+                    }
+                    TuiCommand::ResumeJob(id) => {
+                        let _ = orchestrator_cmd.resume_job(&id).await;
+                    }
+                    TuiCommand::DeleteJob(id) => {
+                        let _ = orchestrator_cmd.delete_job(&id).await;
+                    }
+                    TuiCommand::CleanDatabase => {
+                        let _ = orchestrator_cmd.clean_database().await;
+                    }
+                    TuiCommand::SaveProvider(config) => {
+                        orchestrator_cmd.save_provider(config).await;
+                    }
+                    TuiCommand::DeleteProvider(id) => {
+                        orchestrator_cmd.delete_provider(&id).await;
+                    }
+                    TuiCommand::StartJob(config) => {
+                        let _ = orchestrator_cmd.submit_job(config).await;
+                    }
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

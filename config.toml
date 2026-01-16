@@ -1,0 +1,61 @@
+[runtime]
+max_global_concurrency = 4
+dataset_root = "./datasets"
+database_url = "sqlite://destilation.db"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-3.5-turbo"
+
+[providers.ollama]
+base_url = "http://localhost:11434"
+model = "llama3"
+
+[templates.general-reasoning]
+id = "general-reasoning"
+name = "General Reasoning"
+description = "A general purpose reasoning template"
+mode = "simple"
+system_prompt = "You are a helpful assistant."
+user_prompt_pattern = "{{prompt}}"
+validators = ["structural"]
+
+[templates.general-reasoning.schema]
+version = "1.0"
+fields = [
+    { name = "reasoning", field_type = "string", required = true },
+    { name = "answer", field_type = "string", required = true }
+]
+
+[templates.code-generation]
+id = "code-generation"
+name = "Code Generation"
+description = "Generate code based on requirements"
+mode = "simple"
+system_prompt = "You are an expert programmer."
+user_prompt_pattern = "Write code for: {{prompt}}"
+validators = ["structural"]
+
+[templates.code-generation.schema]
+version = "1.0"
+fields = [
+    { name = "code", field_type = "string", required = true },
+    { name = "explanation", field_type = "string", required = true }
+]
+
+[templates.creative-writing]
+id = "creative-writing"
+name = "Creative Writing"
+description = "Creative writing tasks"
+mode = "simple"
+system_prompt = "You are a creative writer."
+user_prompt_pattern = "Write a story about: {{prompt}}"
+validators = ["structural"]
+
+[templates.creative-writing.schema]
+version = "1.0"
+fields = [
+    { name = "story", field_type = "string", required = true },
+    { name = "characters", field_type = "array", required = false }
+]

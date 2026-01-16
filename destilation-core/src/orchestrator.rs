@@ -47,7 +47,7 @@ impl Orchestrator {
     }
 
     pub async fn delete_job(&self, job_id: &JobId) -> anyhow::Result<()> {
-        // Delete tasks first to maintain referential integrity if enforced, 
+        // Delete tasks first to maintain referential integrity if enforced,
         // though our trait methods handle them independently.
         self.task_store.delete_tasks_by_job(job_id).await?;
         self.job_store.delete_job(job_id).await?;
@@ -66,14 +66,15 @@ impl Orchestrator {
         let mut candidates: Vec<(String, f32)> = Vec::new();
         let providers = self.providers.read().await;
         let configs = self.provider_configs.read().await;
-        
+
         for spec in &config.providers {
             // Check if provider is enabled
-            let is_enabled = configs.iter()
+            let is_enabled = configs
+                .iter()
                 .find(|c| c.id() == &spec.provider_id)
                 .map(|c| c.is_enabled())
                 .unwrap_or(false);
-                
+
             if !is_enabled {
                 continue;
             }
@@ -165,7 +166,7 @@ impl Orchestrator {
                 .provider_id
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("task has no provider"))?;
-            
+
             let provider = {
                 let providers = self.providers.read().await;
                 providers
@@ -173,7 +174,7 @@ impl Orchestrator {
                     .ok_or_else(|| anyhow::anyhow!("provider not registered"))?
                     .clone()
             };
-            
+
             let template = self
                 .templates
                 .get(&task.template_id)
@@ -182,7 +183,8 @@ impl Orchestrator {
 
             let model_name = {
                 let configs = self.provider_configs.read().await;
-                configs.iter()
+                configs
+                    .iter()
                     .find(|c| c.id() == &provider_id)
                     .map(|c| match c {
                         ProviderConfig::OpenRouter { model, .. } => model.clone(),
@@ -285,7 +287,7 @@ impl Orchestrator {
         use crate::providers::create_provider;
         let id = config.id().clone();
         let provider = create_provider(config.clone());
-        
+
         // Update both maps
         {
             let mut providers = self.providers.write().await;

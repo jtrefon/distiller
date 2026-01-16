@@ -71,17 +71,14 @@ impl ModelProvider for ScriptProvider {
 
         let mut child = cmd.spawn().map_err(|_| ProviderError::Unavailable)?;
 
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or(ProviderError::Transport)?;
-        
+        let stdin = child.stdin.as_mut().ok_or(ProviderError::Transport)?;
+
         let input_json = serde_json::to_string(&request).map_err(|_| ProviderError::Transport)?;
         stdin
             .write_all(input_json.as_bytes())
             .await
             .map_err(|_| ProviderError::Transport)?;
-        
+
         // Close stdin to signal end of input
         drop(child.stdin.take());
 
@@ -95,8 +92,9 @@ impl ModelProvider for ScriptProvider {
             return Err(ProviderError::InvalidResponse);
         }
 
-        let output_str = String::from_utf8(output.stdout).map_err(|_| ProviderError::InvalidResponse)?;
-        
+        let output_str =
+            String::from_utf8(output.stdout).map_err(|_| ProviderError::InvalidResponse)?;
+
         // Try to parse as JSON first
         let script_output: ScriptOutput = match serde_json::from_str(&output_str) {
             Ok(json) => json,

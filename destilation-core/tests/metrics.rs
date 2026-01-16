@@ -54,10 +54,7 @@ async fn metrics_count_basic_flow() {
 
     let mut providers: HashMap<String, Arc<dyn destilation_core::provider::ModelProvider>> =
         HashMap::new();
-    providers.insert(
-        "mock".to_string(),
-        Arc::new(TestProvider),
-    );
+    providers.insert("mock".to_string(), Arc::new(TestProvider));
 
     let template = TemplateConfig {
         id: TemplateId::from("simple_qa"),
@@ -96,7 +93,7 @@ async fn metrics_count_basic_flow() {
     // Mock config for the mock provider so orchestrator can find model name
     {
         let mut configs = provider_configs.write().await;
-        configs.push(destilation_core::provider::ProviderConfig::OpenRouter { 
+        configs.push(destilation_core::provider::ProviderConfig::OpenRouter {
             id: "mock".to_string(),
             name: Some("TestProvider".to_string()),
             enabled: true,

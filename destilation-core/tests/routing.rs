@@ -180,6 +180,9 @@ async fn select_provider_respects_capabilities() {
             metadata: Default::default(),
         },
     };
-    let sel = orch.select_provider_id(&job).await.expect("provider selected");
+    let sel = orch
+        .select_provider_id(&job)
+        .await
+        .expect("provider selected");
     assert_eq!(sel, "p2");
 }

@@ -67,10 +67,7 @@ impl ModelProvider for OllamaProvider {
             .json()
             .await
             .map_err(|_| ProviderError::InvalidResponse)?;
-        let content = body
-            .get("response")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let content = body.get("response").and_then(|v| v.as_str()).unwrap_or("");
 
         Ok(GenerationResult {
             provider_id: request.provider_id,
@@ -84,7 +81,12 @@ impl ModelProvider for OllamaProvider {
 
     async fn health_check(&self) -> Result<(), ProviderError> {
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
-        let resp = self.client.get(url).send().await.map_err(|_| ProviderError::Transport)?;
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|_| ProviderError::Transport)?;
         if resp.status().is_success() {
             Ok(())
         } else {

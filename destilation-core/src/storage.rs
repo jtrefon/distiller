@@ -131,7 +131,8 @@ impl TaskStore for InMemoryTaskStore {
     }
 
     async fn list_tasks(&self, job_id: &JobId) -> anyhow::Result<Vec<Task>> {
-        let tasks: Vec<Task> = self.states
+        let tasks: Vec<Task> = self
+            .states
             .lock()
             .unwrap()
             .values()
@@ -144,10 +145,10 @@ impl TaskStore for InMemoryTaskStore {
     async fn delete_tasks_by_job(&self, job_id: &JobId) -> anyhow::Result<()> {
         let mut states = self.states.lock().unwrap();
         states.retain(|_, v| &v.job_id != job_id);
-        
+
         let mut inner = self.inner.lock().unwrap();
         inner.retain(|t| &t.job_id != job_id);
-        
+
         Ok(())
     }
 }
