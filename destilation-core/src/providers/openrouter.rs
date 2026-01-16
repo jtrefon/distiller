@@ -26,6 +26,36 @@ impl OpenRouterProvider {
             model,
         }
     }
+    pub async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .client
+            .get(url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|_| ProviderError::Transport)?;
+
+        if !resp.status().is_success() {
+            return Err(ProviderError::InvalidResponse);
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ModelData {
+            id: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct ModelsResponse {
+            data: Vec<ModelData>,
+        }
+
+        let body: ModelsResponse = resp
+            .json()
+            .await
+            .map_err(|_| ProviderError::InvalidResponse)?;
+
+        Ok(body.data.into_iter().map(|m| m.id).collect())
+    }
 }
 
 #[async_trait]

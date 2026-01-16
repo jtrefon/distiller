@@ -2,19 +2,21 @@ use crate::domain::{
     Job, JobConfig, JobId, PromptSpec, Sample, Task, TaskState, TemplateConfig, TemplateId,
 };
 use crate::metrics::Metrics;
-use crate::provider::{GenerationRequest, ModelProvider};
+use crate::provider::{GenerationRequest, ModelProvider, ProviderConfig};
 use crate::storage::{DatasetWriter, JobStore, TaskStore};
 use crate::validation::{ValidationContext, ValidationOutcome, Validator};
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct Orchestrator {
     pub job_store: Arc<dyn JobStore>,
     pub task_store: Arc<dyn TaskStore>,
-    pub providers: HashMap<String, Arc<dyn ModelProvider>>,
+    pub providers: Arc<RwLock<HashMap<String, Arc<dyn ModelProvider>>>>,
+    pub provider_configs: Arc<RwLock<Vec<ProviderConfig>>>,
     pub templates: HashMap<TemplateId, TemplateConfig>,
     pub validators: Vec<Arc<dyn Validator>>,
     pub dataset_writer: Arc<dyn DatasetWriter>,
@@ -28,10 +30,55 @@ impl Orchestrator {
         Ok(job)
     }
 
-    pub fn select_provider_id(&self, config: &JobConfig) -> Option<String> {
+    pub async fn pause_job(&self, job_id: &JobId) -> anyhow::Result<()> {
+        if let Some(mut job) = self.job_store.get_job(job_id).await? {
+            job.status = crate::domain::JobStatus::Paused;
+            self.job_store.update_job(&job).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn resume_job(&self, job_id: &JobId) -> anyhow::Result<()> {
+        if let Some(mut job) = self.job_store.get_job(job_id).await? {
+            job.status = crate::domain::JobStatus::Running;
+            self.job_store.update_job(&job).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn delete_job(&self, job_id: &JobId) -> anyhow::Result<()> {
+        // Delete tasks first to maintain referential integrity if enforced, 
+        // though our trait methods handle them independently.
+        self.task_store.delete_tasks_by_job(job_id).await?;
+        self.job_store.delete_job(job_id).await?;
+        Ok(())
+    }
+
+    pub async fn clean_database(&self) -> anyhow::Result<()> {
+        let jobs = self.job_store.list_jobs().await?;
+        for job in jobs {
+            self.delete_job(&job.id).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn select_provider_id(&self, config: &JobConfig) -> Option<String> {
         let mut candidates: Vec<(String, f32)> = Vec::new();
+        let providers = self.providers.read().await;
+        let configs = self.provider_configs.read().await;
+        
         for spec in &config.providers {
-            if let Some(p) = self.providers.get(&spec.provider_id) {
+            // Check if provider is enabled
+            let is_enabled = configs.iter()
+                .find(|c| c.id() == &spec.provider_id)
+                .map(|c| c.is_enabled())
+                .unwrap_or(false);
+                
+            if !is_enabled {
+                continue;
+            }
+
+            if let Some(p) = providers.get(&spec.provider_id) {
                 let meta = p.metadata();
                 let required = &spec.capabilities_required;
                 let ok = required.is_empty()
@@ -72,6 +119,7 @@ impl Orchestrator {
 
             let provider_id = self
                 .select_provider_id(&job.config)
+                .await
                 .ok_or_else(|| anyhow::anyhow!("no providers available for job"))?;
 
             let prompt = PromptSpec {
@@ -117,20 +165,36 @@ impl Orchestrator {
                 .provider_id
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("task has no provider"))?;
-            let provider = self
-                .providers
-                .get(&provider_id)
-                .ok_or_else(|| anyhow::anyhow!("provider not registered"))?
-                .clone();
+            
+            let provider = {
+                let providers = self.providers.read().await;
+                providers
+                    .get(&provider_id)
+                    .ok_or_else(|| anyhow::anyhow!("provider not registered"))?
+                    .clone()
+            };
+            
             let template = self
                 .templates
                 .get(&task.template_id)
                 .ok_or_else(|| anyhow::anyhow!("template not found"))?
                 .clone();
 
+            let model_name = {
+                let configs = self.provider_configs.read().await;
+                configs.iter()
+                    .find(|c| c.id() == &provider_id)
+                    .map(|c| match c {
+                        ProviderConfig::OpenRouter { model, .. } => model.clone(),
+                        ProviderConfig::Ollama { model, .. } => model.clone(),
+                        ProviderConfig::Script { .. } => "script".to_string(),
+                    })
+                    .unwrap_or_else(|| "unknown".to_string())
+            };
+
             let req = GenerationRequest {
                 provider_id: provider_id.clone(),
-                model: "mock".to_string(),
+                model: model_name,
                 prompt: task.prompt_spec.clone(),
                 max_tokens: None,
                 temperature: None,
@@ -215,5 +279,44 @@ impl Orchestrator {
             issues,
             score,
         }
+    }
+
+    pub async fn save_provider(&self, config: ProviderConfig) {
+        use crate::providers::create_provider;
+        let id = config.id().clone();
+        let provider = create_provider(config.clone());
+        
+        // Update both maps
+        {
+            let mut providers = self.providers.write().await;
+            providers.insert(id.clone(), Arc::from(provider));
+        }
+        {
+            let mut configs = self.provider_configs.write().await;
+            // Replace if exists, or push
+            if let Some(pos) = configs.iter().position(|c| c.id() == &id) {
+                configs[pos] = config;
+            } else {
+                configs.push(config);
+            }
+        }
+    }
+
+    pub async fn delete_provider(&self, id: &str) {
+        {
+            let mut providers = self.providers.write().await;
+            providers.remove(id);
+        }
+        {
+            let mut configs = self.provider_configs.write().await;
+            if let Some(pos) = configs.iter().position(|c| c.id() == id) {
+                configs.remove(pos);
+            }
+        }
+    }
+
+    pub async fn list_providers(&self) -> Vec<ProviderConfig> {
+        let configs = self.provider_configs.read().await;
+        configs.clone()
     }
 }

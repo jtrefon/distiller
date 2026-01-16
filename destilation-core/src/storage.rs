@@ -12,6 +12,7 @@ pub trait JobStore: Send + Sync {
     async fn get_job(&self, id: &JobId) -> anyhow::Result<Option<Job>>;
     async fn update_job(&self, job: &Job) -> anyhow::Result<()>;
     async fn list_jobs(&self) -> anyhow::Result<Vec<Job>>;
+    async fn delete_job(&self, id: &JobId) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -20,6 +21,7 @@ pub trait TaskStore: Send + Sync {
     async fn fetch_next_task(&self) -> anyhow::Result<Option<Task>>;
     async fn update_task(&self, task: &Task) -> anyhow::Result<()>;
     async fn list_tasks(&self, job_id: &JobId) -> anyhow::Result<Vec<Task>>;
+    async fn delete_tasks_by_job(&self, job_id: &JobId) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -81,6 +83,11 @@ impl JobStore for InMemoryJobStore {
     async fn list_jobs(&self) -> anyhow::Result<Vec<Job>> {
         Ok(self.inner.lock().unwrap().values().cloned().collect())
     }
+
+    async fn delete_job(&self, id: &JobId) -> anyhow::Result<()> {
+        self.inner.lock().unwrap().remove(id);
+        Ok(())
+    }
 }
 
 pub struct InMemoryTaskStore {
@@ -132,6 +139,16 @@ impl TaskStore for InMemoryTaskStore {
             .cloned()
             .collect();
         Ok(tasks)
+    }
+
+    async fn delete_tasks_by_job(&self, job_id: &JobId) -> anyhow::Result<()> {
+        let mut states = self.states.lock().unwrap();
+        states.retain(|_, v| &v.job_id != job_id);
+        
+        let mut inner = self.inner.lock().unwrap();
+        inner.retain(|t| &t.job_id != job_id);
+        
+        Ok(())
     }
 }
 
@@ -316,6 +333,14 @@ impl JobStore for SqliteJobStore {
             });
         }
         Ok(jobs)
+    }
+
+    async fn delete_job(&self, id: &JobId) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM jobs WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -518,5 +543,13 @@ impl TaskStore for SqliteTaskStore {
             });
         }
         Ok(tasks)
+    }
+
+    async fn delete_tasks_by_job(&self, job_id: &JobId) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM tasks WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }

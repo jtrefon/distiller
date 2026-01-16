@@ -37,7 +37,7 @@ The **Destilation** project has reached a stable foundation. The core architectu
 1.  **Advanced Validation**:
     - Implement LLM-based supervisors/judges for higher-quality data filtering.
 2.  **Storage Expansion**:
-    - Add S3/GCS dataset writers for cloud-native workflows.
+     - (Removed S3/GCS as per user request to focus on local stability).
 3.  **Documentation**:
     - Expand `CONTRIBUTING.md` with new test guidelines.
     - Document the SQLite schema and migration process.

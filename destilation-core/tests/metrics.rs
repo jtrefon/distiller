@@ -4,12 +4,45 @@ use destilation_core::domain::{
 };
 use destilation_core::metrics::{InMemoryMetrics, Metrics};
 use destilation_core::orchestrator::Orchestrator;
-use destilation_core::providers::MockProvider;
+use destilation_core::provider::{
+    GenerationRequest, GenerationResult, ModelProvider, ProviderMetadata,
+};
 use destilation_core::storage::{FilesystemDatasetWriter, InMemoryJobStore, InMemoryTaskStore};
 use destilation_core::validation::Validator;
 use destilation_core::validators::StructuralValidator;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
+
+struct TestProvider;
+
+#[async_trait::async_trait]
+impl ModelProvider for TestProvider {
+    fn metadata(&self) -> ProviderMetadata {
+        ProviderMetadata {
+            id: "mock".to_string(),
+            name: "TestProvider".to_string(),
+            models: vec!["mock".to_string()],
+            max_tokens: None,
+            supports_tools: false,
+            capabilities: vec!["general".to_string()],
+        }
+    }
+
+    async fn generate(
+        &self,
+        request: GenerationRequest,
+    ) -> Result<GenerationResult, destilation_core::provider::ProviderError> {
+        Ok(GenerationResult {
+            provider_id: request.provider_id,
+            model: request.model,
+            raw_output: "{\"question\": \"q\", \"answer\": \"a\"}".to_string(),
+            latency: std::time::Duration::from_millis(10),
+            usage: None,
+            metadata: HashMap::new(),
+        })
+    }
+}
 
 #[tokio::test]
 async fn metrics_count_basic_flow() {
@@ -23,7 +56,7 @@ async fn metrics_count_basic_flow() {
         HashMap::new();
     providers.insert(
         "mock".to_string(),
-        Arc::new(MockProvider::new("mock".to_string())),
+        Arc::new(TestProvider),
     );
 
     let template = TemplateConfig {
@@ -59,10 +92,25 @@ async fn metrics_count_basic_flow() {
 
     let metrics = Arc::new(InMemoryMetrics::new());
 
+    let provider_configs = Arc::new(RwLock::new(Vec::new()));
+    // Mock config for the mock provider so orchestrator can find model name
+    {
+        let mut configs = provider_configs.write().await;
+        configs.push(destilation_core::provider::ProviderConfig::OpenRouter { 
+            id: "mock".to_string(),
+            name: Some("TestProvider".to_string()),
+            enabled: true,
+            base_url: "http://localhost".to_string(),
+            api_key: "key".to_string(),
+            model: "mock".to_string(),
+        });
+    }
+
     let orch = Orchestrator {
         job_store,
         task_store,
-        providers,
+        providers: Arc::new(RwLock::new(providers)),
+        provider_configs,
         templates,
         validators,
         dataset_writer,

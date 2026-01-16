@@ -1,5 +1,5 @@
 pub mod tui;
-use crate::tui::{Tui, TuiUpdate};
+use crate::tui::{Tui, TuiCommand, TuiUpdate};
 use clap::Parser;
 use destilation_core::domain::{
     DomainSpec, JobConfig, JobOutputConfig, JobProviderSpec, JobValidationConfig, ReasoningMode,
@@ -239,50 +239,51 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
         templates.insert(template.id.clone(), template.clone());
     }
 
-    let mut providers: HashMap<String, Arc<dyn destilation_core::provider::ModelProvider>> =
-        HashMap::new();
-    let mock = Arc::from(create_provider(ProviderConfig::Mock {
-        id: "mock".to_string(),
-    }));
-    providers.insert("mock".to_string(), mock);
+    let mut provider_configs = Vec::new();
 
     if let Some(pconf) = gc.as_ref().and_then(|g| g.providers.as_ref()) {
         if let Some(or) = &pconf.openrouter {
             if let Ok(key) = std::env::var(&or.api_key_env) {
                 let config = ProviderConfig::OpenRouter {
                     id: "openrouter".to_string(),
+                    name: Some("OpenRouter".to_string()),
+                    enabled: true,
                     base_url: or.base_url.clone(),
                     api_key: key,
                     model: or.model.clone(),
                 };
-                providers.insert(
-                    "openrouter".to_string(),
-                    Arc::from(create_provider(config)),
-                );
+                provider_configs.push(config);
             }
         }
         if let Some(ol) = &pconf.ollama {
             let config = ProviderConfig::Ollama {
                 id: "ollama".to_string(),
+                name: Some("Ollama".to_string()),
+                enabled: true,
                 base_url: ol.base_url.clone(),
                 model: ol.model.clone(),
             };
-            providers.insert(
-                "ollama".to_string(),
-                Arc::from(create_provider(config)),
-            );
+            provider_configs.push(config);
         }
         if let Some(scripts) = &pconf.scripts {
             for (id, script_conf) in scripts {
                 let config = ProviderConfig::Script {
                     id: id.clone(),
+                    name: Some(id.clone()),
+                    enabled: true,
                     command: script_conf.command.clone(),
                     args: script_conf.args.clone().unwrap_or_default(),
                     timeout_ms: script_conf.timeout_ms,
                 };
-                providers.insert(id.clone(), Arc::from(create_provider(config)));
+                provider_configs.push(config);
             }
         }
+    }
+
+    let mut providers = HashMap::new();
+    for config in &provider_configs {
+        let p = create_provider(config.clone());
+        providers.insert(config.id().clone(), Arc::from(p));
     }
 
     let mut validators: Vec<Arc<dyn Validator>> = vec![Arc::new(StructuralValidator::new())];
@@ -360,10 +361,16 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
         };
 
     let metrics = Arc::new(InMemoryMetrics::new());
+    
+    // Create Arc<RwLock> wrappers for orchestrator
+    let providers_arc = Arc::new(tokio::sync::RwLock::new(providers));
+    let provider_configs_arc = Arc::new(tokio::sync::RwLock::new(provider_configs));
+
     let orchestrator = Orchestrator {
         job_store,
         task_store,
-        providers,
+        providers: providers_arc,
+        provider_configs: provider_configs_arc,
         templates,
         validators,
         dataset_writer,
@@ -420,11 +427,33 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
                     }
                 }
             }
+            // Send provider updates
+            let providers = orchestrator_monitor.list_providers().await;
+            let _ = tx.send(TuiUpdate::Providers(providers));
+            
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     });
 
-    let mut tui = Tui::new(metrics_clone, rx);
+    let (tx_cmd, rx_cmd) = std::sync::mpsc::channel();
+    let orchestrator_cmd = orchestrator.clone();
+    tokio::spawn(async move {
+        loop {
+            while let Ok(cmd) = rx_cmd.try_recv() {
+                match cmd {
+                    TuiCommand::PauseJob(id) => { let _ = orchestrator_cmd.pause_job(&id).await; },
+                    TuiCommand::ResumeJob(id) => { let _ = orchestrator_cmd.resume_job(&id).await; },
+                    TuiCommand::DeleteJob(id) => { let _ = orchestrator_cmd.delete_job(&id).await; },
+                    TuiCommand::CleanDatabase => { let _ = orchestrator_cmd.clean_database().await; },
+                    TuiCommand::SaveProvider(config) => { orchestrator_cmd.save_provider(config).await; },
+                    TuiCommand::DeleteProvider(id) => { orchestrator_cmd.delete_provider(&id).await; },
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+
+    let mut tui = Tui::new(metrics_clone, rx, tx_cmd);
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let done_clone = done.clone();
     tokio::spawn(async move {
@@ -466,9 +495,6 @@ fn build_job_providers(
             .collect()
     } else {
         let mut v = Vec::new();
-        if all_providers.contains_key("mock") {
-            v.push("mock".to_string());
-        }
         if all_providers.contains_key("openrouter") {
             v.push("openrouter".to_string());
         }
@@ -487,14 +513,6 @@ fn build_job_providers(
             provider_id: id,
             weight: 1.0,
             capabilities_required: caps,
-        });
-    }
-
-    if specs.is_empty() && all_providers.contains_key("mock") {
-        specs.push(JobProviderSpec {
-            provider_id: "mock".to_string(),
-            weight: 1.0,
-            capabilities_required: vec!["general".to_string()],
         });
     }
 

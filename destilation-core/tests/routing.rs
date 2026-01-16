@@ -9,6 +9,7 @@ use destilation_core::provider::{
 use destilation_core::storage::{DatasetWriter, JobStore, TaskStore};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 struct DummyStore;
 #[async_trait::async_trait]
@@ -28,6 +29,9 @@ impl JobStore for DummyStore {
     async fn list_jobs(&self) -> anyhow::Result<Vec<destilation_core::domain::Job>> {
         unimplemented!()
     }
+    async fn delete_job(&self, _id: &String) -> anyhow::Result<()> {
+        unimplemented!()
+    }
 }
 #[async_trait::async_trait]
 impl TaskStore for DummyStore {
@@ -44,6 +48,9 @@ impl TaskStore for DummyStore {
         &self,
         _job_id: &String,
     ) -> anyhow::Result<Vec<destilation_core::domain::Task>> {
+        unimplemented!()
+    }
+    async fn delete_tasks_by_job(&self, _job_id: &String) -> anyhow::Result<()> {
         unimplemented!()
     }
 }
@@ -84,8 +91,8 @@ impl ModelProvider for StaticProvider {
     }
 }
 
-#[test]
-fn select_provider_respects_capabilities() {
+#[tokio::test]
+async fn select_provider_respects_capabilities() {
     let mut providers: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
     providers.insert(
         "p1".to_string(),
@@ -102,10 +109,33 @@ fn select_provider_respects_capabilities() {
         }),
     );
 
+    let provider_configs = Arc::new(RwLock::new(Vec::new()));
+    {
+        let mut configs = provider_configs.write().await;
+        // Add enabled configs for p1 and p2
+        configs.push(destilation_core::provider::ProviderConfig::Script {
+            id: "p1".to_string(),
+            name: Some("p1".to_string()),
+            enabled: true,
+            command: "echo".to_string(),
+            args: vec![],
+            timeout_ms: Some(1000),
+        });
+        configs.push(destilation_core::provider::ProviderConfig::Script {
+            id: "p2".to_string(),
+            name: Some("p2".to_string()),
+            enabled: true,
+            command: "echo".to_string(),
+            args: vec![],
+            timeout_ms: Some(1000),
+        });
+    }
+
     let orch = Orchestrator {
         job_store: Arc::new(DummyStore),
         task_store: Arc::new(DummyStore),
-        providers,
+        providers: Arc::new(RwLock::new(providers)),
+        provider_configs,
         templates: HashMap::new(),
         validators: Vec::new(),
         dataset_writer: Arc::new(DummyStore),
@@ -150,6 +180,6 @@ fn select_provider_respects_capabilities() {
             metadata: Default::default(),
         },
     };
-    let sel = orch.select_provider_id(&job).expect("provider selected");
+    let sel = orch.select_provider_id(&job).await.expect("provider selected");
     assert_eq!(sel, "p2");
 }

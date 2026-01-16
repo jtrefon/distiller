@@ -59,24 +59,61 @@ pub enum ProviderError {
 pub enum ProviderConfig {
     OpenRouter {
         id: ProviderId,
+        name: Option<String>,
+        enabled: bool,
         base_url: String,
         api_key: String,
         model: String,
     },
     Ollama {
         id: ProviderId,
+        name: Option<String>,
+        enabled: bool,
         base_url: String,
         model: String,
     },
     Script {
         id: ProviderId,
+        name: Option<String>,
+        enabled: bool,
         command: String,
         args: Vec<String>,
         timeout_ms: Option<u64>,
     },
-    Mock {
-        id: ProviderId,
-    },
+}
+
+impl ProviderConfig {
+    pub fn id(&self) -> &ProviderId {
+        match self {
+            Self::OpenRouter { id, .. } => id,
+            Self::Ollama { id, .. } => id,
+            Self::Script { id, .. } => id,
+        }
+    }
+
+    pub fn name(&self) -> Option<&String> {
+        match self {
+            Self::OpenRouter { name, .. } => name.as_ref(),
+            Self::Ollama { name, .. } => name.as_ref(),
+            Self::Script { name, .. } => name.as_ref(),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            Self::OpenRouter { enabled, .. } => *enabled,
+            Self::Ollama { enabled, .. } => *enabled,
+            Self::Script { enabled, .. } => *enabled,
+        }
+    }
+
+    pub fn set_enabled(&mut self, is_enabled: bool) {
+        match self {
+            Self::OpenRouter { enabled, .. } => *enabled = is_enabled,
+            Self::Ollama { enabled, .. } => *enabled = is_enabled,
+            Self::Script { enabled, .. } => *enabled = is_enabled,
+        }
+    }
 }
 
 #[async_trait]
