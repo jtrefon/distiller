@@ -59,3 +59,41 @@ fields = [
     { name = "story", field_type = "string", required = true },
     { name = "characters", field_type = "array", required = false }
 ]
+
+[templates.quad-reasoning]
+id = "quad-reasoning"
+name = "Quad Reasoning"
+description = "Reasoning with context and question separation"
+mode = "Quad"
+system_prompt = "You are a professional reasoner. Provide detailed context and clear step-by-step thinking."
+user_prompt_pattern = "Domain: {{domain}}\nTask: {{prompt}}"
+validators = ["structural"]
+
+[templates.quad-reasoning.schema]
+version = "1.0"
+fields = [
+    { name = "context", field_type = "string", required = true },
+    { name = "question", field_type = "string", required = true },
+    { name = "thought", field_type = "string", required = true },
+    { name = "answer", field_type = "string", required = true }
+]
+
+[templates.preference-reasoning]
+id = "preference-reasoning"
+name = "Preference Learning"
+description = "Generate chosen and rejected reasoning pairs"
+mode = "Preference"
+system_prompt = "You are an AI trainer. Generate a perfect response and a subtly failed one for comparison."
+user_prompt_pattern = "Generate a reasoning sample for: {{prompt}}"
+validators = ["structural"]
+
+[templates.preference-reasoning.schema]
+version = "1.0"
+fields = [
+    { name = "context", field_type = "string", required = true },
+    { name = "question", field_type = "string", required = true },
+    { name = "chosen_thought", field_type = "string", required = true },
+    { name = "chosen_answer", field_type = "string", required = true },
+    { name = "rejected_thought", field_type = "string", required = true },
+    { name = "rejected_answer", field_type = "string", required = true }
+]

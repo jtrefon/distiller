@@ -112,12 +112,25 @@ impl ModelProvider for OpenRouterProvider {
             })?;
 
         if !resp.status().is_success() {
-            return Err(ProviderError::InvalidResponse);
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(ProviderError::RateLimited);
+            }
+            
+            // All other errors are critical as per user requirement
+            let msg = format!("OpenRouter Error {}: {}", status, body);
+            println!("{}", msg);
+            return Err(ProviderError::Critical(msg));
         }
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|_| ProviderError::InvalidResponse)?;
+            .map_err(|e| {
+                println!("OpenRouter JSON parse error: {:?}", e);
+                ProviderError::InvalidResponse
+            })?;
         let content = body
             .pointer("/choices/0/message/content")
             .and_then(|v| v.as_str())

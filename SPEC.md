@@ -1,332 +1,114 @@
-# Destilation – Architecture and Scope
+# Destilation – High-Performance Agentic Distillation
 
 ## 1. Project Overview
 
 ### 1.1 Vision
 
-Destilation is an open-source, Rust-based, Linux-targeted system for agentic model distillation. It orchestrates multiple external LLM providers (OpenRouter, Ollama-compatible local APIs, and future plugins) to generate high-quality, structured datasets for fine-tuning.
+Destilation is a high-performance, Rust-based system designed to generate massive, high-quality datasets for LLM fine-tuning. It orchestrates multiple providers (OpenRouter, Ollama, etc.) to distill expert model knowledge into structured formats, supporting complex reasoning, tool usage, and domain-specific traces.
 
-### 1.2 Objectives
+### 1.2 Core Objectives
 
-- High-throughput, multi-provider distillation pipeline with strong supervision.
-- Support for:
-  - Simple outputs.
-  - Reasoning-heavy or chain-of-thought outputs.
-  - Mixture-of-experts (MoE) configurations.
-  - Tool-using traces.
-- Output template system with built-in and custom formats.
-- Strong quality, validation, and deduplication layers.
-- First-class CLI and TUI for observability and control.
-- Top-tier engineering standards:
-  - Clean architecture, SOLID, DRY, SRP, YAGNI, KISS.
-  - Strict coding standards enforced in CI.
-  - Static analysis and 100 percent unit-test coverage on production code.
-  - GitHub CI/CD pipeline for build and release.
-
-### 1.3 Targets
-
-- Runtime: Linux.
-- Development: macOS and Linux.
-- Distribution: GitHub releases (binaries and Docker images).
+- **High-Throughput Orchestration**: Parallel execution across multiple providers with intelligent rate-limiting and scheduling.
+- **Multi-Modal Distillation**:
+  - **Simple Q&A**: Standard instruction-following pairs.
+  - **Reasoning**: Detailed Chain-of-Thought (CoT) traces for complex problem solving.
+  - **Tool-Enabled**: Agentic traces showing reasoning followed by tool calls and environment responses.
+  - **Coding**: Code generation with or without explanatory reasoning steps.
+- **Strict Quality Control**: Multi-layer validation (structural, syntactic, semantic) and mandatory deduplication.
+- **Observability**: Real-time throughput tracing and progress monitoring via a first-class TUI.
+- **Zero-DB Architecture**: Stateless core with file-based configuration and directory-centric dataset management.
 
 ---
 
 ## 2. Core Domain Model
 
-### 2.1 Jobs, Tasks and Samples
+### 2.1 Jobs and Samples
 
-- Job
-  - High-level distillation campaign.
-  - Defines domains, output templates, provider mix, validation rules and target dataset size.
-- Task
-  - Individual generation unit associated with a job.
-  - Represents a single sample to be generated, validated and persisted.
-- Sample
-  - Validated output stored in the dataset.
-  - Conforms to a specific output template and associated schema.
+- **Job**: A single distillation campaign defined in a `config.toml` or passed via CLI.
+  - **Domain**: The subject area (e.g., "Quantum Physics", "Rust Systems Programming").
+  - **Target Size**: Specific count of samples to generate.
+  - **Template**: The structural blueprint for the output.
+  - **Provider Mix**: Distribution of work across different model backends.
+- **Sample**: A single validated unit of the dataset.
+  - Must conform to the template schema.
+  - Persisted as a JSON object in a `.jsonl` file.
 
-### 2.2 Agents
+### 2.2 Orchestration Flow
 
-- Orchestrator
-  - Manages jobs, schedules tasks and coordinates workers and validation.
-  - Ensures no duplicate work and tracks global progress.
-- Workers
-  - Execute tasks by calling model providers in parallel.
-  - Use templates to construct prompts and interpret responses.
-- Validation agent
-  - Validates outputs structurally, syntactically and semantically.
-  - Detects corruption, duplication and standard violations.
-  - Provides structured feedback for retry loops.
-- Persistence agent
-  - Writes validated samples to durable storage in the configured format.
-  - Maintains dataset metadata and indices.
+1. **Initialization**: Load configuration and existing dataset state from the target folder.
+2. **Task Generation**: Orchestrator generates task units based on the target count and domain.
+3. **Worker Execution**: Parallel workers pull tasks, select providers, and execute generation using the job's template.
+4. **Supervised Validation**:
+   - **Structural**: Validates JSON and schema conformity.
+   - **Semantic**: Checks for exact and fuzzy duplicates.
+   - **Recovery**: Failed samples trigger a retry loop with structural feedback provided back to the model.
+5. **Persistence**: Validated samples are appended to the dataset file in real-time.
 
 ---
 
-## 3. Templates and Distillation Modes
+## 3. Template System
 
-Destilation uses a template system to define the structure, style and semantics of outputs.
+Destilation uses a rigorous template system to ensure dataset consistency.
 
-### 3.1 Template Types
+### 3.1 Built-in Templates
 
-- Simple template
-  - Direct, concise outputs such as Q and A or instructions.
-- MoE template
-  - Outputs encoding domain or expert labels and possibly multiple expert-style answers.
-- Reasoning template
-  - Multi-step reasoning or chain-of-thought.
-- Tool-trace template
-  - Captures reasoning and tool calls for tool-using models.
-- Custom template
-  - User-defined structures backed by an explicit schema.
+- **simple_qa**: `{"question": "...", "answer": "..."}`
+- **reasoning**: `{"question": "...", "reasoning": "...", "answer": "..."}`
+- **tool_trace**: `{"thought": "...", "tool_call": "...", "tool_response": "...", "final_answer": "..."}`
+- **coding**: `{"requirement": "...", "code": "...", "explanation": "..."}`
+- **coding_reasoning**: `{"requirement": "...", "reasoning": "...", "code": "..."}`
 
-### 3.2 Template Definition
+### 3.2 Custom Templates
 
-Each template defines:
-
-- Identifier, name and description.
-- Mode: simple, moe, reasoning, tools or custom.
-- Schema:
-  - Fields, types and constraints.
-  - Required and optional fields.
-- Serialization policy:
-  - JSON-encoded objects.
-  - JSONL dataset output, one sample per line.
-- Prompting specification:
-  - System message describing distillation goals.
-  - User prompt pattern.
-  - Optional few-shot examples.
-- Validation configuration:
-  - Structural and semantic validators for this template.
-  - Additional rules such as reasoning length and tool trace correctness.
-
-### 3.3 Template Configuration
-
-- Templates are configured via repository config files.
-- Jobs reference templates by identifier.
-- Users can:
-  - Use built-in templates.
-  - Add custom templates with custom schemas.
-  - Override or extend validation rules per template.
+- Users define custom templates in `config.toml`.
+- **Definition**:
+  - `id`: Unique identifier.
+  - `schema`: A list of required fields and their types.
+  - `system_prompt`: Instructions for the model.
+  - `user_prompt_pattern`: A template string with placeholders like `{{domain}}`.
+- **Introspection**: The CLI/TUI must be able to "show" the content/schema of any template so users can reference them for custom building.
 
 ---
 
-## 4. Architecture
+## 4. Architecture & Storage
 
-### 4.1 Architectural Style
+### 4.1 File-Based Orchestration
 
-- Clean or hexagonal architecture.
-- Core domain is independent of HTTP clients, storage engines and UI.
-- Ports and adapters:
-  - Ports: model providers, validators, storage and UI.
-  - Adapters: OpenRouter provider, Ollama provider, filesystem storage, terminal UI and similar.
-- Key patterns:
-  - Strategy for provider selection and validation policies.
-  - Factory for job, template and validator instantiation.
-  - Pipeline for validation stages.
-  - Command for job execution.
+- **Configuration**: All global and job-specific settings live in `config.toml`.
+- **Storage**:
+  - **Datasets**: Extracted to specific folders (e.g., `./datasets/job-name/`).
+  - **Metadata**: A `metadata.json` or `.events.jsonl` in the dataset folder tracks progress, throughput, and validator statistics.
+- **No Database**: SQLite or other relational DBs are explicitly excluded to avoid unnecessary complexity and state drift.
 
 ### 4.2 Components
 
-- CLI layer
-  - Commands: run, list-jobs, show-job, resume and related commands.
-  - Parses configuration and starts the orchestrator.
-- Orchestrator
-  - Manages task queues per job.
-  - Applies routing strategies to providers.
-  - Tracks job and task states in the state store.
-- Worker pool
-  - Async workers executing tasks.
-  - Each worker:
-    - Builds prompt from template.
-    - Calls providers.
-    - Passes responses to validation.
-- Validation pipeline
-  - Sequence of validators:
-    - Structural JSON and schema validation.
-    - Content rules.
-    - Deduplication checks.
-    - Optional LLM-based validation or scoring.
-- Persistence layer
-  - Writes JSONL datasets and maintains metadata and indices.
-  - Uses a pluggable storage interface.
-- State store
-  - Database, initially SQLite, persisting job, task and metrics state.
-- TUI or UI layer
-  - Provides real-time visualization and control in the terminal.
-
-### 4.3 Execution Model
-
-- Single process, multithreaded async runtime in the initial version.
-- Bounded internal queues for tasks and results.
-- Future option to run workers as separate processes or services.
+- **Core**: Domain logic, templates, and validation pipeline.
+- **Providers**: Adapters for OpenRouter (SaaS) and Ollama (Local).
+- **CLI**: The main entry point for running jobs and managing templates.
+- **TUI**: Real-time dashboard with:
+  - Total samples vs. Target.
+  - Durchsatz (samples/min).
+  - Validation pass/fail rates.
+  - Real-time event log.
 
 ---
 
-## 5. Providers and Plugins
+## 5. Quality & Validation
 
-### 5.1 Model Providers
+### 5.1 Deduplication
 
-- Model providers expose:
-  - Metadata such as supported models, capabilities and token limits.
-  - Async generation function accepting structured prompts.
-- Built-in providers:
-  - OpenRouter provider.
-  - Ollama provider.
-  - Mock provider for testing.
+- **Hash-based**: Prevents exact string matches.
+- **Semantic**: Jaccard similarity or embedding-based checks to prevent redundant data points.
 
-### 5.2 Multi-Provider Execution
+### 5.2 Error Recovery
 
-- Provider selection strategies:
-  - Round-robin.
-  - Weighted random.
-  - Capability-based routing.
-- Multiple providers active simultaneously for throughput and data diversity.
-
-### 5.3 Plugin Mechanism
-
-- Phase one:
-  - Providers compiled into the binary and configured via type names.
-- Phase two:
-  - External provider plugins communicating over a simple protocol.
-  - Optional WASM-based providers.
+- Workers detect model hallucinations or structural errors.
+- **Retry Mechanism**: The system re-prompts the model, including the specific validation error, up to a configurable `max_attempts`.
 
 ---
 
-## 6. Validation and Supervision
+## 6. Verification Requirements
 
-### 6.1 Validation Pipeline
-
-- Structural validator
-  - Ensures valid JSON and schema conformity.
-- Syntactic validator
-  - Detects truncation and corruption.
-- Semantic or rule-based validators
-  - Domain rules and quality rules.
-- Deduplication validator
-  - Hash-based exact duplicate detection.
-  - Optional semantic similarity based detection.
-- LLM-based supervisor
-  - Optional stronger model used to vet or score samples.
-
-### 6.2 Feedback and Retries
-
-- On failure:
-  - Structured validation outcome with issues and hints.
-  - Worker re-prompts with feedback.
-  - Retries limited by per-job maximum attempts.
-- On repeated failure:
-  - Task marked rejected.
-  - Reasons recorded for analysis.
-
----
-
-## 7. TUI Specification
-
-### 7.1 Approach
-
-- Cross-platform terminal user interface.
-- Implemented using a modern Rust TUI library and ASCII or Unicode enriched layout.
-- TUI is optional but first-class. CLI continues to work without it.
-
-### 7.2 Views
-
-- Main dashboard
-  - Global status of jobs.
-  - System throughput and provider health.
-  - Validation pass rate and error rates.
-- Job detail view
-  - Progress bars.
-  - Counts per state.
-  - Domain, template and provider breakdowns.
-- Task and agent view
-  - Worker states and per-agent throughput.
-  - Validation statistics and common failures.
-- Logs and events
-  - Filterable log window with job, provider and severity filters.
-
-### 7.3 Interactions
-
-- Keyboard-driven navigation.
-- Actions:
-  - Pause or resume jobs.
-  - Inspect individual tasks.
-  - Toggle detail level and filters.
-
----
-
-## 8. Quality, Testing and Static Analysis
-
-### 8.1 Testing Strategy
-
-- Unit tests
-  - Target of 100 percent coverage on production code, excluding generated code.
-  - Cover core domain logic, templates, providers, validation and persistence.
-- Integration tests
-  - End to end orchestration, worker, validation and persistence flows.
-  - Tests for multi-provider runs and job resumption.
-- Property-based tests
-  - For critical parsers and scheduling logic where useful.
-
-### 8.2 Coverage and Static Analysis
-
-- Coverage
-  - Coverage tools integrated into CI.
-  - Builds fail if coverage falls below agreed thresholds.
-- Static analysis
-  - Formatting enforced by rustfmt.
-  - Linting enforced by clippy with most warnings treated as errors.
-  - Dependency checks using common Rust audit tooling.
-
----
-
-## 9. CI and CD
-
-### 9.1 Continuous Integration
-
-- GitHub Actions workflow for pull requests and pushes to main.
-- Steps:
-  - Format check.
-  - Linting.
-  - Unit and integration tests.
-  - Coverage and audit checks.
-- All checks must pass before merging.
-
-### 9.2 Continuous Delivery and Releases
-
-- Tagged releases:
-  - Build release binaries for Linux and macOS.
-  - Build and publish Docker images.
-  - Attach binaries to GitHub releases.
-- Semantic versioning:
-  - Versioning follows major, minor and patch semantics.
-
----
-
-## 10. Licensing
-
-- License: Apache License 2.0.
-- Rationale:
-  - Common for infrastructure and AI projects.
-  - Includes explicit patent grant and contribution terms.
-  - Supports both open and commercial usage.
-
----
-
-## 11. Roadmap Summary
-
-- Phase one
-  - Core MVP with clean architecture.
-  - Built-in templates and providers.
-  - Basic validation pipeline and persistence.
-  - Basic TUI dashboard.
-  - CI with formatting, linting, tests, coverage and audit.
-- Phase two
-  - Provider plugins.
-  - Advanced validators and semantic deduplication.
-  - Enhanced TUI views.
-  - Additional storage backends.
-- Phase three
-  - Distributed workers.
-  - Integration with training pipelines.
-  - Optional web dashboard.
+- **Unit Tests**: 100% coverage on core logic and template rendering.
+- **Integration Tests**: End-to-end dry runs using a `MockProvider`.
+- **Performance**: Capable of sustaining high-throughput generation without memory leaks or file handle exhaustion.

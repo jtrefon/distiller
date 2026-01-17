@@ -55,6 +55,9 @@ pub enum ReasoningMode {
     Moe,
     Reasoning,
     Tools,
+    Quad,
+    Preference,
+    ToolTrace,
     Custom(String),
 }
 
@@ -106,6 +109,8 @@ pub struct Task {
     pub prompt_spec: PromptSpec,
     pub raw_response: Option<String>,
     pub validation_result: Option<crate::validation::ValidationOutcome>,
+    pub quality_score: Option<f32>,
+    pub is_negative: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,6 +124,7 @@ pub struct Sample {
     pub schema_version: String,
     pub payload: serde_json::Value,
     pub quality_score: Option<f32>,
+    pub is_negative: bool,
     pub tags: Vec<String>,
 }
 
@@ -155,6 +161,9 @@ pub enum TemplateMode {
     Moe,
     Reasoning,
     Tools,
+    Quad,
+    Preference,
+    ToolTrace,
     Custom,
 }
 

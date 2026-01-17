@@ -54,6 +54,8 @@ pub enum ProviderError {
     InvalidResponse,
     #[error("provider unavailable")]
     Unavailable,
+    #[error("critical error: {0}")]
+    Critical(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

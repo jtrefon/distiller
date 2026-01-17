@@ -13,7 +13,6 @@ async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 rand = "0.8"
 jsonschema = "0.38.1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "process", "io-util"] }
 
 [dev-dependencies]

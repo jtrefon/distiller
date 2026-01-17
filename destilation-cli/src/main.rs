@@ -2,23 +2,20 @@ pub mod tui;
 use crate::tui::{Tui, TuiCommand, TuiUpdate};
 use clap::Parser;
 use destilation_core::domain::{
-    DomainSpec, JobConfig, JobOutputConfig, JobProviderSpec, JobValidationConfig, ReasoningMode,
     TemplateConfig, TemplateId, TemplateMode, TemplateSchema, TemplateSchemaField,
 };
 use destilation_core::logging::BufferedFileEventLogger;
 use destilation_core::metrics::{InMemoryMetrics, Metrics};
 use destilation_core::orchestrator::Orchestrator;
 use destilation_core::storage::{
-    FilesystemDatasetWriter, InMemoryJobStore, InMemoryTaskStore, JobStore, SqliteJobStore,
-    SqliteTaskStore, TaskStore,
+    DirectoryJobStore, DirectoryProviderStore, DirectoryTaskStore, DirectoryTemplateStore,
+    FilesystemDatasetWriter, JobStore, ProviderStore,
 };
 use destilation_core::validation::Validator;
 use destilation_core::validators::DedupValidator;
 use destilation_core::validators::SemanticDedupValidator;
 use destilation_core::validators::StructuralValidator;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -26,6 +23,7 @@ pub struct Cli {
     #[arg(long)]
     pub config: Option<String>,
 }
+
 
 #[tokio::main]
 async fn main() {
@@ -43,13 +41,10 @@ struct GlobalConfig {
 
 #[derive(serde::Deserialize)]
 struct RuntimeConfig {
-    max_global_concurrency: Option<u32>,
     dataset_root: Option<String>,
-    database_url: Option<String>,
 }
 
 use destilation_core::provider::ProviderConfig;
-use destilation_core::providers::create_provider;
 
 #[derive(serde::Deserialize)]
 struct ProvidersConfig {
@@ -105,14 +100,7 @@ struct TemplateFieldToml {
 
 #[derive(serde::Deserialize)]
 struct JobToml {
-    id: Option<String>,
-    name: Option<String>,
-    description: Option<String>,
-    target_samples: Option<u64>,
-    max_concurrency: Option<u32>,
-    template_id: Option<String>,
     validators: Option<Vec<String>>,
-    providers: Option<Vec<String>>,
 }
 
 fn load_global_config(path: Option<String>) -> Option<GlobalConfig> {
@@ -126,35 +114,93 @@ fn load_global_config(path: Option<String>) -> Option<GlobalConfig> {
 async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
     let gc = load_global_config(config_path);
 
-    let database_url = gc
-        .as_ref()
-        .and_then(|g| g.runtime.as_ref().and_then(|r| r.database_url.clone()));
-
-    let (job_store, task_store): (Arc<dyn JobStore>, Arc<dyn TaskStore>) =
-        if let Some(url) = database_url {
-            let options = SqliteConnectOptions::from_str(&url)?.create_if_missing(true);
-            let pool = SqlitePool::connect_with(options).await?;
-            let js = SqliteJobStore::new(pool.clone());
-            js.init().await?;
-            let ts = SqliteTaskStore::new(pool);
-            ts.init().await?;
-            (Arc::new(js), Arc::new(ts))
-        } else {
-            (
-                Arc::new(InMemoryJobStore::new()),
-                Arc::new(InMemoryTaskStore::new()),
-            )
-        };
-
     let dataset_root = gc
         .as_ref()
         .and_then(|g| g.runtime.as_ref().and_then(|r| r.dataset_root.clone()))
         .unwrap_or_else(|| "datasets/default".to_string());
-    let _global_concurrency = gc
-        .as_ref()
-        .and_then(|g| g.runtime.as_ref().and_then(|r| r.max_global_concurrency));
+
+    let job_store = Arc::new(DirectoryJobStore::new(dataset_root.clone()));
+    let task_store = Arc::new(DirectoryTaskStore::new(dataset_root.clone()));
+    let provider_store = Arc::new(DirectoryProviderStore::new(dataset_root.clone()));
+    let template_store = Arc::new(DirectoryTemplateStore::new(dataset_root.clone()));
     let dataset_writer = Arc::new(FilesystemDatasetWriter::new(dataset_root.clone()));
 
+    let templates = setup_templates(&gc);
+    let provider_configs = setup_providers(&gc, provider_store.as_ref());
+
+    let mut providers = HashMap::new();
+    for config in &provider_configs {
+        let p = destilation_core::providers::create_provider(config.clone());
+        providers.insert(config.id().clone(), Arc::from(p));
+    }
+
+    let validators = setup_validators(&gc);
+    let metrics = Arc::new(InMemoryMetrics::new());
+    let event_logger = Arc::new(BufferedFileEventLogger::new(2000, 500));
+
+    let orchestrator = Orchestrator {
+        job_store: job_store.clone(),
+        task_store: task_store.clone(),
+        provider_store: provider_store.clone(),
+        providers: Arc::new(tokio::sync::RwLock::new(providers)),
+        provider_configs: Arc::new(tokio::sync::RwLock::new(provider_configs)),
+        template_store: template_store.clone(),
+        templates: templates.clone(),
+        validators,
+        dataset_writer,
+        metrics: metrics.clone(),
+        logger: event_logger.clone(),
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = tx.send(TuiUpdate::Templates(templates.values().cloned().collect()));
+    
+    spawn_monitor_tasks(tx, orchestrator.clone(), event_logger.clone());
+
+    let (tx_cmd, rx_cmd) = std::sync::mpsc::channel();
+    spawn_command_handler(rx_cmd, orchestrator.clone());
+
+    // Auto-resume jobs that were already Running
+    if let Ok(jobs) = job_store.list_jobs().await {
+        for job in jobs {
+            if job.status == destilation_core::domain::JobStatus::Running {
+                let runner = orchestrator.clone();
+                let job_id = job.id.clone();
+                tokio::spawn(async move {
+                    let _ = runner.run_job(&job_id).await;
+                });
+            }
+        }
+    }
+
+    let metrics_clone = metrics.clone();
+    let mut tui = Tui::new(metrics_clone, rx, tx_cmd, dataset_root.clone());
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_clone = done.clone();
+    
+    let tui_res = tokio::task::spawn_blocking(move || {
+        tui.run(|| done_clone.load(std::sync::atomic::Ordering::Relaxed))
+    })
+    .await?;
+
+    tui_res?;
+
+    let snap = metrics.snapshot();
+    println!(
+        "metrics: jobs_submitted={} tasks_enqueued={} tasks_started={} tasks_persisted={} tasks_rejected={} samples_persisted={} validator_pass={} validator_fail={}",
+        snap.jobs_submitted,
+        snap.tasks_enqueued,
+        snap.tasks_started,
+        snap.tasks_persisted,
+        snap.tasks_rejected,
+        snap.samples_persisted,
+        snap.validator_pass,
+        snap.validator_fail
+    );
+    Ok(())
+}
+
+fn setup_templates(gc: &Option<GlobalConfig>) -> HashMap<TemplateId, TemplateConfig> {
     let mut templates = HashMap::new();
     if let Some(tconf) = gc.as_ref().and_then(|g| g.templates.as_ref()) {
         for t in tconf.values() {
@@ -164,6 +210,9 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
                 Some("Moe") => TemplateMode::Moe,
                 Some("Reasoning") => TemplateMode::Reasoning,
                 Some("Tools") => TemplateMode::Tools,
+                Some("Quad") => TemplateMode::Quad,
+                Some("Preference") => TemplateMode::Preference,
+                Some("ToolTrace") => TemplateMode::ToolTrace,
                 _ => TemplateMode::Custom,
             };
             let schema = if let Some(s) = &t.schema {
@@ -239,56 +288,60 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
             examples: vec![],
             validators: vec!["structural".to_string()],
         };
-        templates.insert(template.id.clone(), template.clone());
+        templates.insert(template.id.clone(), template);
     }
+    templates
+}
 
-    let mut provider_configs = Vec::new();
-
-    if let Some(pconf) = gc.as_ref().and_then(|g| g.providers.as_ref()) {
-        if let Some(or) = &pconf.openrouter {
-            if let Ok(key) = std::env::var(&or.api_key_env) {
-                let config = ProviderConfig::OpenRouter {
-                    id: "openrouter".to_string(),
-                    name: Some("OpenRouter".to_string()),
+fn setup_providers(gc: &Option<GlobalConfig>, provider_store: &dyn ProviderStore) -> Vec<ProviderConfig> {
+    let mut provider_configs = provider_store.list_providers().unwrap_or_default();
+    if provider_configs.is_empty() {
+        if let Some(pconf) = gc.as_ref().and_then(|g| g.providers.as_ref()) {
+            if let Some(or) = &pconf.openrouter {
+                if let Ok(key) = std::env::var(&or.api_key_env) {
+                    let config = ProviderConfig::OpenRouter {
+                        id: "openrouter".to_string(),
+                        name: Some("OpenRouter".to_string()),
+                        enabled: true,
+                        base_url: or.base_url.clone(),
+                        api_key: key,
+                        model: or.model.clone(),
+                    };
+                    provider_configs.push(config.clone());
+                    let _ = provider_store.save_provider(&config);
+                }
+            }
+            if let Some(ol) = &pconf.ollama {
+                let config = ProviderConfig::Ollama {
+                    id: "ollama".to_string(),
+                    name: Some("Ollama".to_string()),
                     enabled: true,
-                    base_url: or.base_url.clone(),
-                    api_key: key,
-                    model: or.model.clone(),
+                    base_url: ol.base_url.clone(),
+                    model: ol.model.clone(),
                 };
-                provider_configs.push(config);
+                provider_configs.push(config.clone());
+                let _ = provider_store.save_provider(&config);
+            }
+            if let Some(scripts) = &pconf.scripts {
+                for (id, script_conf) in scripts {
+                    let config = ProviderConfig::Script {
+                        id: id.clone(),
+                        name: Some(id.clone()),
+                        enabled: true,
+                        command: script_conf.command.clone(),
+                        args: script_conf.args.clone().unwrap_or_default(),
+                        timeout_ms: script_conf.timeout_ms,
+                    };
+                    provider_configs.push(config.clone());
+                    let _ = provider_store.save_provider(&config);
+                }
             }
         }
-        if let Some(ol) = &pconf.ollama {
-            let config = ProviderConfig::Ollama {
-                id: "ollama".to_string(),
-                name: Some("Ollama".to_string()),
-                enabled: true,
-                base_url: ol.base_url.clone(),
-                model: ol.model.clone(),
-            };
-            provider_configs.push(config);
-        }
-        if let Some(scripts) = &pconf.scripts {
-            for (id, script_conf) in scripts {
-                let config = ProviderConfig::Script {
-                    id: id.clone(),
-                    name: Some(id.clone()),
-                    enabled: true,
-                    command: script_conf.command.clone(),
-                    args: script_conf.args.clone().unwrap_or_default(),
-                    timeout_ms: script_conf.timeout_ms,
-                };
-                provider_configs.push(config);
-            }
-        }
     }
+    provider_configs
+}
 
-    let mut providers = HashMap::new();
-    for config in &provider_configs {
-        let p = create_provider(config.clone());
-        providers.insert(config.id().clone(), Arc::from(p));
-    }
-
+fn setup_validators(gc: &Option<GlobalConfig>) -> Vec<Arc<dyn Validator>> {
     let mut validators: Vec<Arc<dyn Validator>> = vec![Arc::new(StructuralValidator::new())];
     if let Some(jobs) = gc.as_ref().and_then(|g| g.jobs.as_ref()) {
         if let Some(job) = jobs.first() {
@@ -303,199 +356,93 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
     } else {
         validators.push(Arc::new(DedupValidator::new()));
     }
-    let selected_template_id = if let Some(jobs) = gc.as_ref().and_then(|g| g.jobs.as_ref()) {
-        if let Some(job) = jobs.first() {
-            if let Some(tid) = &job.template_id {
-                TemplateId::from(tid.clone())
-            } else {
-                templates
-                    .keys()
-                    .next()
-                    .cloned()
-                    .unwrap_or_else(|| TemplateId::from("simple_qa"))
-            }
-        } else {
-            TemplateId::from("simple_qa")
-        }
-    } else {
-        templates
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| TemplateId::from("simple_qa"))
-    };
+    validators
+}
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let default_id = format!("job-default-{}", timestamp);
-
-    let (job_id, job_name, job_desc, target_samples, max_concurrency, job_providers) =
-        if let Some(jobs) = gc.as_ref().and_then(|g| g.jobs.as_ref()) {
-            if let Some(job) = jobs.first() {
-                (
-                    job.id.clone().unwrap_or_else(|| default_id.clone()),
-                    job.name
-                        .clone()
-                        .unwrap_or_else(|| "Default Job".to_string()),
-                    job.description
-                        .clone()
-                        .or_else(|| Some("Default distillation job".to_string())),
-                    job.target_samples.unwrap_or(3),
-                    job.max_concurrency.unwrap_or(1),
-                    build_job_providers(&providers, job.providers.as_ref()),
-                )
-            } else {
-                (
-                    default_id.clone(),
-                    "Default Job".to_string(),
-                    Some("Default distillation job".to_string()),
-                    3,
-                    1,
-                    build_job_providers(&providers, None),
-                )
-            }
-        } else {
-            (
-                default_id.clone(),
-                "Default Job".to_string(),
-                Some("Default distillation job".to_string()),
-                3,
-                1,
-                build_job_providers(&providers, None),
-            )
-        };
-
-    let metrics = Arc::new(InMemoryMetrics::new());
-
-    // Create Arc<RwLock> wrappers for orchestrator
-    let providers_arc = Arc::new(tokio::sync::RwLock::new(providers));
-    let provider_configs_arc = Arc::new(tokio::sync::RwLock::new(provider_configs));
-
-    let event_logger = Arc::new(BufferedFileEventLogger::new(2000, 500));
-
-    let orchestrator = Orchestrator {
-        job_store,
-        task_store,
-        providers: providers_arc,
-        provider_configs: provider_configs_arc,
-        templates: templates.clone(),
-        validators,
-        dataset_writer,
-        metrics: metrics.clone(),
-        logger: event_logger.clone(),
-    };
-
-    let dataset_dir = format!("{dataset_root}/{job_id}");
-
-    let job_config = JobConfig {
-        id: job_id,
-        name: job_name,
-        description: job_desc,
-        target_samples,
-        max_concurrency,
-        domains: vec![DomainSpec {
-            id: "algorithms".to_string(),
-            name: "Algorithms".to_string(),
-            weight: 1.0,
-            tags: vec!["cs".to_string()],
-        }],
-        template_id: selected_template_id,
-        reasoning_mode: ReasoningMode::Simple,
-        providers: job_providers,
-        validation: JobValidationConfig {
-            max_attempts: 2,
-            validators: vec!["structural".to_string(), "dedup".to_string()],
-            min_quality_score: Some(0.8),
-            fail_fast: true,
-        },
-        output: JobOutputConfig {
-            dataset_dir,
-            shard_size: 1000,
-            compress: false,
-            metadata: HashMap::new(),
-        },
-    };
-
-    let job = orchestrator.submit_job(job_config).await?;
-    let job_id = job.id.clone();
-    let orchestrator_clone = orchestrator.clone();
-    let metrics_clone = metrics.clone();
-
-    let handle = tokio::spawn(async move { orchestrator_clone.run_job(&job_id).await });
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _ = tx.send(TuiUpdate::Templates(templates.values().cloned().collect()));
-    let orchestrator_monitor = orchestrator.clone();
-    let event_logger_monitor = event_logger.clone();
+fn spawn_monitor_tasks(tx: std::sync::mpsc::Sender<TuiUpdate>, orchestrator: Orchestrator, logger: Arc<BufferedFileEventLogger>) {
     tokio::spawn(async move {
         let mut last_seq: u64 = 0;
         loop {
-            if let Ok(jobs) = orchestrator_monitor.job_store.list_jobs().await {
+            if let Ok(jobs) = orchestrator.job_store.list_jobs().await {
                 let _ = tx.send(TuiUpdate::Jobs(jobs.clone()));
                 for job in jobs {
-                    if let Ok(tasks) = orchestrator_monitor.task_store.list_tasks(&job.id).await {
+                    if let Ok(tasks) = orchestrator.task_store.list_tasks(&job.id).await {
                         let _ = tx.send(TuiUpdate::Tasks(job.id, tasks));
                     }
                 }
             }
-            // Send provider updates
-            let providers = orchestrator_monitor.list_providers().await;
+            let providers = orchestrator.list_providers().await;
             let _ = tx.send(TuiUpdate::Providers(providers));
 
-            let (new_last, events) = event_logger_monitor.events_since(last_seq);
+            let (new_last, events) = logger.events_since(last_seq);
             last_seq = new_last;
             if !events.is_empty() {
+                // Check for critical errors to show popup
+                for event in &events {
+                    if event.level == destilation_core::logging::LogLevel::Error && event.message == "job.error" {
+                        if let Some(job_id) = &event.job_id {
+                            if let Some(error_msg) = event.fields.get("error") {
+                                let _ = tx.send(TuiUpdate::ErrorPopup(job_id.clone(), error_msg.clone()));
+                            }
+                        }
+                    }
+                }
                 let _ = tx.send(TuiUpdate::LogEvents(events));
             }
 
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     });
+}
 
-    let (tx_cmd, rx_cmd) = std::sync::mpsc::channel();
-    let orchestrator_cmd = orchestrator.clone();
+fn spawn_command_handler(rx_cmd: std::sync::mpsc::Receiver<TuiCommand>, mut orchestrator: Orchestrator) {
     tokio::spawn(async move {
         loop {
             while let Ok(cmd) = rx_cmd.try_recv() {
                 match cmd {
                     TuiCommand::PauseJob(id) => {
-                        let _ = orchestrator_cmd.pause_job(&id).await;
+                        let _ = orchestrator.pause_job(&id).await;
                     }
                     TuiCommand::ResumeJob(id) => {
-                        let was_pending = orchestrator_cmd
+                        let prev_status = orchestrator
                             .job_store
                             .get_job(&id)
                             .await
                             .ok()
                             .flatten()
-                            .map(|j| j.status == destilation_core::domain::JobStatus::Pending)
-                            .unwrap_or(false);
-                        let _ = orchestrator_cmd.resume_job(&id).await;
-                        if was_pending {
-                            let runner = orchestrator_cmd.clone();
+                            .map(|j| j.status.clone());
+                        
+                        let _ = orchestrator.resume_job(&id).await;
+                        
+                        // Spawn runner if it was Pending or if the loop could have been lost (e.g. status was Running but app restarted)
+                        // Actually, to be safe, we should probably always spawn if it's not already running.
+                        // Since we don't track active runners here, we'll assume ResumeJob needs a runner if it was Paused or Pending.
+                        if matches!(prev_status, Some(destilation_core::domain::JobStatus::Pending) | Some(destilation_core::domain::JobStatus::Paused)) {
+                            let runner = orchestrator.clone();
                             tokio::spawn(async move {
                                 let _ = runner.run_job(&id).await;
                             });
                         }
                     }
                     TuiCommand::DeleteJob(id) => {
-                        let _ = orchestrator_cmd.delete_job(&id).await;
-                    }
-                    TuiCommand::CleanDatabase => {
-                        let _ = orchestrator_cmd.clean_database().await;
+                        let _ = orchestrator.delete_job(&id).await;
                     }
                     TuiCommand::SaveProvider(config) => {
-                        orchestrator_cmd.save_provider(config).await;
+                        orchestrator.save_provider(config).await;
                     }
                     TuiCommand::DeleteProvider(id) => {
-                        orchestrator_cmd.delete_provider(&id).await;
+                        orchestrator.delete_provider(&id).await;
+                    }
+                    TuiCommand::SaveTemplate(template) => {
+                        orchestrator.save_template(template).await;
+                    }
+                    TuiCommand::DeleteTemplate(id) => {
+                        orchestrator.delete_template(&id).await;
                     }
                     TuiCommand::StartJob(config) => {
-                        if let Ok(job) = orchestrator_cmd.submit_job(config).await {
+                        if let Ok(job) = orchestrator.submit_job(config).await {
                             let job_id = job.id.clone();
-                            let runner = orchestrator_cmd.clone();
+                            let runner = orchestrator.clone();
                             tokio::spawn(async move {
                                 let _ = runner.run_job(&job_id).await;
                             });
@@ -506,69 +453,5 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     });
-
-    let mut tui = Tui::new(metrics_clone, rx, tx_cmd, dataset_root.clone());
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let done_clone = done.clone();
-    tokio::spawn(async move {
-        let _ = handle.await;
-        done_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
-
-    let tui_res = tokio::task::spawn_blocking(move || {
-        tui.run(|| done.load(std::sync::atomic::Ordering::Relaxed))
-    })
-    .await?;
-
-    tui_res?;
-
-    let snap = metrics.snapshot();
-    println!(
-        "metrics: jobs_submitted={} tasks_enqueued={} tasks_started={} tasks_persisted={} tasks_rejected={} samples_persisted={} validator_pass={} validator_fail={}",
-        snap.jobs_submitted,
-        snap.tasks_enqueued,
-        snap.tasks_started,
-        snap.tasks_persisted,
-        snap.tasks_rejected,
-        snap.samples_persisted,
-        snap.validator_pass,
-        snap.validator_fail
-    );
-    Ok(())
 }
 
-fn build_job_providers(
-    all_providers: &HashMap<String, Arc<dyn destilation_core::provider::ModelProvider>>,
-    preferred: Option<&Vec<String>>,
-) -> Vec<JobProviderSpec> {
-    let mut specs = Vec::new();
-    let ids: Vec<String> = if let Some(list) = preferred {
-        list.iter()
-            .filter(|id| all_providers.contains_key(*id))
-            .cloned()
-            .collect()
-    } else {
-        let mut v = Vec::new();
-        if all_providers.contains_key("openrouter") {
-            v.push("openrouter".to_string());
-        }
-        if all_providers.contains_key("ollama") {
-            v.push("ollama".to_string());
-        }
-        v
-    };
-
-    for id in ids {
-        let caps = match id.as_str() {
-            "openrouter" | "ollama" => vec!["reasoning".to_string()],
-            _ => vec!["general".to_string()],
-        };
-        specs.push(JobProviderSpec {
-            provider_id: id,
-            weight: 1.0,
-            capabilities_required: caps,
-        });
-    }
-
-    specs
-}

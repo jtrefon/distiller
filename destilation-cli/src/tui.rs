@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::{
@@ -24,12 +24,13 @@ use std::{
 
 pub enum TuiCommand {
     StartJob(JobConfig),
-    PauseJob(JobId),
-    ResumeJob(JobId),
-    DeleteJob(JobId),
-    CleanDatabase,
+    PauseJob(String),
+    ResumeJob(String),
+    DeleteJob(String),
     SaveProvider(ProviderConfig),
     DeleteProvider(ProviderId),
+    SaveTemplate(TemplateConfig),
+    DeleteTemplate(destilation_core::domain::TemplateId),
 }
 
 pub enum TuiUpdate {
@@ -38,6 +39,7 @@ pub enum TuiUpdate {
     Providers(Vec<ProviderConfig>),
     Templates(Vec<TemplateConfig>),
     LogEvents(Vec<LogEvent>),
+    ErrorPopup(String, String), // (job_id, error_message)
 }
 
 type JobId = String;
@@ -66,6 +68,7 @@ struct TuiState {
 
     // Job Creation State
     templates: Vec<TemplateConfig>,
+    template_list_state: ListState,
     job_create_name: String,
     job_create_domain: String,
     job_create_samples: String,
@@ -79,9 +82,22 @@ struct TuiState {
     focus: FocusArea,
     selected_f_key_index: usize,
 
-    started_at: std::time::Instant,
+    editing_template: Option<TemplateConfig>,
+    template_edit_field_idx: usize,
+    template_preview_output: Option<String>,
+
     dataset_root: String,
     job_logs: HashMap<JobId, Vec<LogEvent>>,
+    global_logs: Vec<LogEvent>,
+    log_list_state: ListState,
+
+    // Session-based metrics for accurate throughput
+    samples_at_start: u64,
+    tasks_at_start: u64,
+    session_started_at: Option<std::time::Instant>,
+    
+    // Error popup
+    error_popup: Option<(String, String)>, // (job_id, error_message)
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -94,6 +110,9 @@ enum View {
     ProviderList,
     ProviderEdit,
     ProviderTypeSelect,
+    LogViewer,
+    TemplateList,
+    TemplateEdit,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -122,30 +141,26 @@ impl TuiState {
             model_search_query: String::new(),
             filtered_models: Vec::new(),
             available_models: vec![
+                // Free models (verified from OpenRouter API)
+                "deepseek/deepseek-r1-0528:free".to_string(),
+                "qwen/qwen3-next-80b-a3b-instruct:free".to_string(),
+                "nvidia/nemotron-nano-12b-v2-vl:free".to_string(),
+                "nvidia/nemotron-nano-9b-v2:free".to_string(),
+                "qwen/qwen3-coder:free".to_string(),
+                "google/gemma-3n-e4b-it:free".to_string(),
+                "google/gemma-3n-e2b-it:free".to_string(),
+                "mistralai/devstral-2512:free".to_string(),
+                // Paid models
                 "openai/gpt-4o".to_string(),
                 "openai/gpt-4o-mini".to_string(),
-                "openai/gpt-4-turbo".to_string(),
-                "openai/gpt-3.5-turbo".to_string(),
                 "anthropic/claude-3.5-sonnet".to_string(),
-                "anthropic/claude-3-opus".to_string(),
-                "anthropic/claude-3-sonnet".to_string(),
-                "anthropic/claude-3-haiku".to_string(),
                 "google/gemini-flash-1.5".to_string(),
-                "google/gemini-pro-1.5".to_string(),
-                "google/gemini-pro".to_string(),
                 "meta-llama/llama-3-70b-instruct".to_string(),
-                "meta-llama/llama-3-8b-instruct".to_string(),
-                "mistralai/mixtral-8x22b-instruct".to_string(),
-                "mistralai/mixtral-8x7b-instruct".to_string(),
-                "mistralai/mistral-7b-instruct".to_string(),
-                "mistralai/mistral-7b-instruct:free".to_string(),
-                "openchat/openchat-7b:free".to_string(),
-                "gryphe/mythomist-7b:free".to_string(),
-                "nousresearch/nous-capybara-7b:free".to_string(),
             ],
             model_list_state: ListState::default(),
 
             templates: Vec::new(),
+            template_list_state: ListState::default(),
             job_create_name: String::new(),
             job_create_domain: String::new(),
             job_create_samples: "100".to_string(),
@@ -154,25 +169,40 @@ impl TuiState {
 
             provider_type_idx: 0,
 
+            editing_template: None,
+            template_edit_field_idx: 0,
+            template_preview_output: None,
+
             focus: FocusArea::Main,
             selected_f_key_index: 0,
 
-            started_at: std::time::Instant::now(),
             dataset_root: "datasets/default".to_string(),
             job_logs: HashMap::new(),
+            global_logs: Vec::new(),
+            log_list_state: ListState::default(),
+
+            samples_at_start: 0,
+            tasks_at_start: 0,
+            session_started_at: None,
+            error_popup: None,
         }
     }
 
     fn push_log_events(&mut self, events: Vec<LogEvent>) {
         for ev in events {
-            let Some(job_id) = ev.job_id.clone() else {
-                continue;
-            };
-            let buf = self.job_logs.entry(job_id).or_default();
-            buf.push(ev);
-            if buf.len() > 500 {
-                let drop = buf.len() - 500;
-                buf.drain(0..drop);
+            if let Some(job_id) = ev.job_id.clone() {
+                let buf = self.job_logs.entry(job_id).or_default();
+                buf.push(ev);
+                if buf.len() > 500 {
+                    let drop = buf.len() - 500;
+                    buf.drain(0..drop);
+                }
+            } else {
+                self.global_logs.push(ev);
+                if self.global_logs.len() > 500 {
+                    let drop = self.global_logs.len() - 500;
+                    self.global_logs.drain(0..drop);
+                }
             }
         }
     }
@@ -373,10 +403,27 @@ impl Tui {
                     TuiUpdate::LogEvents(events) => {
                         self.state.push_log_events(events);
                     }
+                    TuiUpdate::ErrorPopup(job_id, error_message) => {
+                        self.state.error_popup = Some((job_id, error_message));
+                    }
                 }
             }
 
             let snap = self.metrics.snapshot();
+            
+            // Session logic: if something is running and we don't have a session, start one.
+            // If nothing is running, clear the session tracker.
+            let any_running = self.state.jobs.iter().any(|j| j.status == destilation_core::domain::JobStatus::Running);
+            if any_running {
+                if self.state.session_started_at.is_none() {
+                    self.state.session_started_at = Some(std::time::Instant::now());
+                    self.state.samples_at_start = snap.samples_persisted;
+                    self.state.tasks_at_start = snap.tasks_persisted;
+                }
+            } else {
+                self.state.session_started_at = None;
+            }
+
             terminal
                 .draw(|f| ui(f, &snap, &mut self.state))
                 .map_err(|_| io::Error::other("draw failed"))?;
@@ -554,12 +601,12 @@ impl Tui {
                                                     }
                                                 }
                                             }
-                                            8 => return Ok(()),
-                                            9 => {
+                                            9 => return Ok(()),
+                                            10 => {
                                                 state.view = View::Settings;
                                                 state.focus = FocusArea::Main;
                                             }
-                                            10 => {
+                                            11 => {
                                                 state.view = View::ProviderList;
                                                 state.focus = FocusArea::Main;
                                             }
@@ -598,6 +645,14 @@ impl Tui {
                         }
                     }
                     Event::Key(key) => {
+                        // Error popup takes priority
+                        if state.error_popup.is_some() {
+                            if key.code == KeyCode::Esc || key.code == KeyCode::Enter {
+                                state.error_popup = None;
+                            }
+                            continue;
+                        }
+                        
                         if state.show_help {
                             if key.code == KeyCode::Esc || key.code == KeyCode::F(1) {
                                 state.show_help = false;
@@ -734,9 +789,16 @@ impl Tui {
                                     }
                                 }
                             }
+                            KeyCode::F(5) => {
+                                if state.view == View::Dashboard || state.view == View::JobDetail {
+                                    state.view = View::LogViewer;
+                                    state.focus = FocusArea::Main;
+                                }
+                            }
                             KeyCode::F(6) => {
-                                if state.view == View::Dashboard {
-                                    state.show_logs = !state.show_logs;
+                                if state.view == View::Dashboard || state.view == View::JobDetail {
+                                    state.view = View::TemplateList;
+                                    state.focus = FocusArea::Main;
                                 }
                             }
                             KeyCode::F(7) => {
@@ -790,6 +852,10 @@ impl Tui {
                                     }
                                 } else if state.view == View::ModelSelect {
                                     state.view = View::ProviderEdit;
+                                } else if state.view == View::LogViewer {
+                                    state.view = View::Dashboard;
+                                } else if state.view == View::TemplateList {
+                                    state.view = View::Dashboard;
                                 }
                             }
                             KeyCode::F(10) => return Ok(()),
@@ -1366,6 +1432,128 @@ impl Tui {
                             }
                             continue;
                         }
+                        if state.view == View::TemplateList {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::F(9) => state.view = View::Dashboard,
+                                KeyCode::Tab => state.focus = FocusArea::BottomBar,
+                                KeyCode::Enter => {
+                                    if let Some(i) = state.template_list_state.selected() {
+                                        if let Some(t) = state.templates.get(i) {
+                                            state.editing_template = Some(t.clone());
+                                            state.view = View::TemplateEdit;
+                                            state.template_edit_field_idx = 0;
+                                        }
+                                    }
+                                }
+                                KeyCode::F(7) => {
+                                    state.editing_template = Some(destilation_core::domain::TemplateConfig {
+                                        id: format!("template-{}", rand::random::<u32>()),
+                                        name: "New Template".to_string(),
+                                        description: String::new(),
+                                        mode: destilation_core::domain::TemplateMode::Simple,
+                                        schema: destilation_core::domain::TemplateSchema {
+                                            version: "1.0.0".to_string(),
+                                            fields: vec![],
+                                            json_schema: None,
+                                        },
+                                        system_prompt: String::new(),
+                                        user_prompt_pattern: "{{prompt}}".to_string(),
+                                        examples: vec![],
+                                        validators: vec![],
+                                    });
+                                    state.view = View::TemplateEdit;
+                                    state.template_edit_field_idx = 0;
+                                }
+                                KeyCode::F(8) => {
+                                    if let Some(i) = state.template_list_state.selected() {
+                                        if let Some(t) = state.templates.get(i) {
+                                            let _ = self.tx_cmd.send(TuiCommand::DeleteTemplate(t.id.clone()));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
+                        if state.view == View::TemplateEdit {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::F(9) => {
+                                    if state.template_preview_output.is_some() {
+                                        state.template_preview_output = None;
+                                    } else {
+                                        state.view = View::TemplateList;
+                                    }
+                                }
+                                KeyCode::Tab => {
+                                    state.template_edit_field_idx = (state.template_edit_field_idx + 1) % 6;
+                                }
+                                KeyCode::BackTab => {
+                                    state.template_edit_field_idx = (state.template_edit_field_idx + 5) % 6;
+                                }
+                                KeyCode::F(5) => {
+                                    if let Some(t) = &state.editing_template {
+                                        let dummy_user_prompt = t.user_prompt_pattern.replace("{{prompt}}", "Explain quantum entanglement in simple terms.");
+                                        let dummy_response = r#"{
+  "explanation": "Quantum entanglement is a phenomenon where two particles become linked...",
+  "status": "success",
+  "metadata": { "model": "gpt-4o", "confidence": 0.98 }
+}"#;
+                                        state.template_preview_output = Some(format!(
+                                            "SYSTEM: {}\n\nUSER: {}\n\nRESPONSE:\n{}",
+                                            t.system_prompt, dummy_user_prompt, dummy_response
+                                        ));
+                                    }
+                                }
+                                KeyCode::Enter | KeyCode::F(10) => {
+                                    if let Some(template) = &state.editing_template {
+                                        let _ = self.tx_cmd.send(TuiCommand::SaveTemplate(template.clone()));
+                                        state.view = View::TemplateList;
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    if let Some(t) = &mut state.editing_template {
+                                        match state.template_edit_field_idx {
+                                            0 => t.id.push(c),
+                                            1 => t.name.push(c),
+                                            2 => t.description.push(c),
+                                            3 => {
+                                                if c == ' ' {
+                                                    t.mode = match t.mode {
+                                                        destilation_core::domain::TemplateMode::Simple => destilation_core::domain::TemplateMode::Reasoning,
+                                                        destilation_core::domain::TemplateMode::Reasoning => destilation_core::domain::TemplateMode::Moe,
+                                                        destilation_core::domain::TemplateMode::Moe => destilation_core::domain::TemplateMode::Tools,
+                                                        destilation_core::domain::TemplateMode::Tools => destilation_core::domain::TemplateMode::Quad,
+                                                        destilation_core::domain::TemplateMode::Quad => destilation_core::domain::TemplateMode::Preference,
+                                                        destilation_core::domain::TemplateMode::Preference => destilation_core::domain::TemplateMode::ToolTrace,
+                                                        destilation_core::domain::TemplateMode::ToolTrace => destilation_core::domain::TemplateMode::Custom,
+                                                        destilation_core::domain::TemplateMode::Custom => destilation_core::domain::TemplateMode::Simple,
+                                                    };
+                                                }
+                                            }
+                                            4 => t.system_prompt.push(c),
+                                            5 => t.user_prompt_pattern.push(c),
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(t) = &mut state.editing_template {
+                                        match state.template_edit_field_idx {
+                                            0 => { t.id.pop(); }
+                                            1 => { t.name.pop(); }
+                                            2 => { t.description.pop(); }
+                                            4 => { t.system_prompt.pop(); }
+                                            5 => { t.user_prompt_pattern.pop(); }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
 
                         match key.code {
                             KeyCode::Tab => state.focus = FocusArea::BottomBar,
@@ -1400,15 +1588,58 @@ impl Tui {
                                 }
                             }
                             KeyCode::Char('c') if state.view == View::Settings => {
-                                let _ = self.tx_cmd.send(TuiCommand::CleanDatabase);
                             }
                             KeyCode::Char('o') if state.view == View::Settings => {
                                 state.view = View::ModelSelect;
                                 state.model_search_query.clear();
                                 state.update_filtered_models();
                             }
-                            KeyCode::Down => state.next_job(),
-                            KeyCode::Up => state.previous_job(),
+                            KeyCode::Down => {
+                                if state.view == View::LogViewer {
+                                    let i = match state.log_list_state.selected() {
+                                        Some(i) => i + 1,
+                                        None => 0,
+                                    };
+                                    state.log_list_state.select(Some(i));
+                                } else if state.view == View::TemplateList {
+                                    let i = match state.template_list_state.selected() {
+                                        Some(i) => {
+                                            if i >= state.templates.len().saturating_sub(1) {
+                                                0
+                                            } else {
+                                                i + 1
+                                            }
+                                        }
+                                        None => 0,
+                                    };
+                                    state.template_list_state.select(Some(i));
+                                } else {
+                                    state.next_job()
+                                }
+                            }
+                            KeyCode::Up => {
+                                if state.view == View::LogViewer {
+                                    let i = match state.log_list_state.selected() {
+                                        Some(i) => i.saturating_sub(1),
+                                        None => 0,
+                                    };
+                                    state.log_list_state.select(Some(i));
+                                } else if state.view == View::TemplateList {
+                                    let i = match state.template_list_state.selected() {
+                                        Some(i) => {
+                                            if i == 0 {
+                                                state.templates.len().saturating_sub(1)
+                                            } else {
+                                                i - 1
+                                            }
+                                        }
+                                        None => 0,
+                                    };
+                                    state.template_list_state.select(Some(i));
+                                } else {
+                                    state.previous_job()
+                                }
+                            }
                             KeyCode::Enter => state.enter_job(),
                             KeyCode::Esc => state.exit_detail(),
                             _ => {}
@@ -1470,19 +1701,28 @@ fn ui(f: &mut Frame, snap: &MetricsSnapshot, state: &mut TuiState) {
     f.render_widget(title, chunks[0]);
 
     let (content_chunk, footer_chunk) = if matches!(state.view, View::Dashboard | View::JobDetail) {
-        let ratio = if snap.tasks_enqueued > 0 {
-            (snap.tasks_persisted as f64 / snap.tasks_enqueued as f64).min(1.0)
+        let active_job = state.jobs.iter().find(|j| j.status == destilation_core::domain::JobStatus::Running)
+            .or_else(|| state.selected_job_id.as_ref().and_then(|id| state.jobs.iter().find(|j| &j.id == id)));
+        
+        let (ratio, label) = if let Some(job) = active_job {
+            let tasks = state.tasks.get(&job.id).map(|v| v.as_slice()).unwrap_or(&[]);
+            let saved = tasks.iter().filter(|t| t.state == destilation_core::domain::TaskState::Persisted).count() as u64;
+            let target = job.config.target_samples.max(1);
+            let pct = (saved as f64 / target as f64).min(1.0);
+            (pct, format!("{}: {} / {} ({}%)", job.config.name, saved, target, (pct * 100.0) as u64))
         } else {
-            0.0
+            (0.0, "No active or selected job".to_string())
         };
+
         let gauge = Gauge::default()
             .block(
                 Block::default()
-                    .title("Total Progress")
+                    .title("Job Progress")
                     .borders(Borders::ALL),
             )
             .gauge_style(Style::default().fg(Color::Green))
-            .ratio(ratio);
+            .ratio(ratio)
+            .label(label);
         f.render_widget(gauge, chunks[1]);
         (chunks[2], chunks[3])
     } else {
@@ -1498,6 +1738,9 @@ fn ui(f: &mut Frame, snap: &MetricsSnapshot, state: &mut TuiState) {
         View::ProviderEdit => render_provider_edit(f, content_chunk, state),
         View::JobCreate => render_job_create(f, content_chunk, state),
         View::ProviderTypeSelect => render_provider_type_select(f, content_chunk, state),
+        View::LogViewer => render_log_viewer(f, content_chunk, state),
+        View::TemplateList => render_template_list(f, content_chunk, state),
+        View::TemplateEdit => render_template_edit(f, content_chunk, state),
     }
 
     let f_keys = get_f_keys(state.view);
@@ -1599,6 +1842,49 @@ fn ui(f: &mut Frame, snap: &MetricsSnapshot, state: &mut TuiState) {
 
         f.render_widget(paragraph, area);
     }
+    
+    // Error popup (takes priority over help)
+    if let Some((job_id, error_message)) = &state.error_popup {
+        use ratatui::widgets::Clear;
+        let block = Block::default()
+            .title("⚠ API Error - Job Paused")
+            .borders(Borders::ALL)
+            .style(Style::default().bg(Color::Red).fg(Color::White));
+        let area = centered_rect(70, 40, f.area());
+        f.render_widget(Clear, area);
+        f.render_widget(block, area);
+
+        let error_text = vec![
+            Line::from(Span::styled(
+                format!("Job: {}", job_id),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Error Message:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(error_message.as_str()),
+            Line::from(""),
+            Line::from("The job has been automatically paused to prevent API bans."),
+            Line::from("Please fix the issue before resuming."),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press ESC or Enter to dismiss",
+                Style::default().add_modifier(Modifier::ITALIC),
+            )),
+        ];
+
+        let paragraph = Paragraph::new(error_text)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::NONE)
+                    .padding(ratatui::widgets::Padding::new(2, 2, 1, 1)),
+            );
+
+        f.render_widget(paragraph, area);
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1642,6 +1928,99 @@ fn render_provider_list(f: &mut Frame, area: Rect, state: &mut TuiState) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     f.render_stateful_widget(list, area, &mut state.provider_list_state);
+}
+
+fn render_template_list(f: &mut Frame, area: Rect, state: &mut TuiState) {
+    let items: Vec<ListItem> = state
+        .templates
+        .iter()
+        .map(|t| {
+            let name = &t.name;
+            let id = &t.id;
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{:<20}", name), Style::default().fg(Color::Cyan)),
+                Span::raw(" "),
+                Span::styled(format!("({})", id), Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title("Templates (F7: New, F8: Delete, Enter: Edit)")
+                .borders(Borders::ALL),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    f.render_stateful_widget(list, area, &mut state.template_list_state);
+}
+fn render_template_edit(f: &mut Frame, area: Rect, state: &mut TuiState) {
+    if let Some(template) = &state.editing_template {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(
+                [
+                    Constraint::Length(3), // ID
+                    Constraint::Length(3), // Name
+                    Constraint::Length(3), // Description
+                    Constraint::Length(3), // Mode
+                    Constraint::Length(10), // System Prompt
+                    Constraint::Min(5),    // User Prompt Pattern
+                ]
+                .as_ref(),
+            )
+            .split(area);
+
+        let fields = [
+            ("ID", template.id.as_str()),
+            ("Name", template.name.as_str()),
+            ("Description", template.description.as_str()),
+            (
+                "Mode",
+                match template.mode {
+                    destilation_core::domain::TemplateMode::Simple => "Simple",
+                    destilation_core::domain::TemplateMode::Reasoning => "Reasoning",
+                    destilation_core::domain::TemplateMode::Moe => "MOE",
+                    destilation_core::domain::TemplateMode::Tools => "Tools",
+                    destilation_core::domain::TemplateMode::Quad => "Quad",
+                    destilation_core::domain::TemplateMode::Preference => "Preference",
+                    destilation_core::domain::TemplateMode::ToolTrace => "ToolTrace",
+                    destilation_core::domain::TemplateMode::Custom => "Custom",
+                },
+            ),
+            ("System Prompt", template.system_prompt.as_str()),
+            ("User Prompt Pattern", template.user_prompt_pattern.as_str()),
+        ];
+
+        for (i, (label, value)) in fields.iter().enumerate() {
+            let is_focused = state.template_edit_field_idx == i;
+            let style = if is_focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+
+            let block = Block::default()
+                .title(*label)
+                .borders(Borders::ALL)
+                .border_style(style);
+
+            let p = Paragraph::new(*value).block(block);
+            f.render_widget(p, chunks[i]);
+        }
+
+        if let Some(preview) = &state.template_preview_output {
+            let preview_area = centered_rect(80, 80, area);
+            f.render_widget(Clear, preview_area);
+            let block = Block::default()
+                .title("Template Preview (Esc to Close)")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green));
+            let p = Paragraph::new(preview.as_str()).block(block).wrap(Wrap { trim: true });
+            f.render_widget(p, preview_area);
+        }
+    }
 }
 
 fn render_provider_edit(f: &mut Frame, area: Rect, state: &mut TuiState) {
@@ -1748,15 +2127,6 @@ fn render_settings(f: &mut Frame, area: Rect) {
         Line::from("Settings"),
         Line::from(""),
         Line::from(vec![
-            Span::raw("Database Cleaning: "),
-            Span::styled(
-                "[c] Clean Database",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" (Wipes all jobs and tasks)"),
-        ]),
-        Line::from(""),
-        Line::from(vec![
             Span::raw("Provider Config: "),
             Span::styled(
                 "[o] OpenRouter Model",
@@ -1810,6 +2180,43 @@ fn render_model_select(f: &mut Frame, area: Rect, state: &mut TuiState) {
     f.render_stateful_widget(list, chunks[1], &mut state.model_list_state);
 }
 
+fn render_log_event(ev: &LogEvent) -> Line<'_> {
+    let ts = ev.ts.format("%H:%M:%S").to_string();
+    let (lvl_str, lvl_style) = match ev.level {
+        destilation_core::logging::LogLevel::Trace => ("TRC", Style::default().fg(Color::DarkGray)),
+        destilation_core::logging::LogLevel::Debug => ("DBG", Style::default().fg(Color::Blue)),
+        destilation_core::logging::LogLevel::Info => ("INF", Style::default().fg(Color::Green)),
+        destilation_core::logging::LogLevel::Warn => ("WRN", Style::default().fg(Color::Yellow)),
+        destilation_core::logging::LogLevel::Error => ("ERR", Style::default().fg(Color::Red)),
+    };
+
+    let mut spans = vec![
+        Span::styled(format!("{} ", ts), Style::default().fg(Color::Gray)),
+        Span::styled(format!("{} ", lvl_str), lvl_style),
+        Span::raw(format!("{} ", ev.message)),
+    ];
+
+    if let Some(task_id) = ev.task_id.as_ref() {
+        let id_short = if task_id.len() > 8 {
+            &task_id[task_id.len() - 8..]
+        } else {
+            task_id
+        };
+        spans.push(Span::styled(format!("[{}] ", id_short), Style::default().fg(Color::Cyan)));
+    }
+
+    // Sort fields for consistent display
+    let mut fields: Vec<_> = ev.fields.iter().collect();
+    fields.sort_by_key(|(k, _)| *k);
+
+    for (k, v) in fields {
+        spans.push(Span::styled(format!("{}:", k), Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(format!("{} ", v), Style::default().fg(Color::White)));
+    }
+
+    Line::from(spans)
+}
+
 fn render_dashboard(f: &mut Frame, area: Rect, snap: &MetricsSnapshot, state: &mut TuiState) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -1838,9 +2245,14 @@ fn render_dashboard(f: &mut Frame, area: Rect, snap: &MetricsSnapshot, state: &m
     let active_providers = state.providers.iter().filter(|p| p.is_enabled()).count();
     let total_providers = state.providers.len();
 
-    let elapsed = state.started_at.elapsed().as_secs_f64().max(0.001);
-    let samples_per_min = snap.samples_persisted as f64 / elapsed * 60.0;
-    let tasks_per_min = snap.tasks_persisted as f64 / elapsed * 60.0;
+    let (samples_per_min, tasks_per_min) = if let Some(start) = state.session_started_at {
+        let elapsed = start.elapsed().as_secs_f64().max(0.001);
+        let samples_delta = snap.samples_persisted.saturating_sub(state.samples_at_start);
+        let tasks_delta = snap.tasks_persisted.saturating_sub(state.tasks_at_start);
+        (samples_delta as f64 / elapsed * 60.0, tasks_delta as f64 / elapsed * 60.0)
+    } else {
+        (0.0, 0.0)
+    };
 
     let stats_text = vec![
         Line::from(vec![
@@ -2108,28 +2520,14 @@ fn render_dashboard(f: &mut Frame, area: Rect, snap: &MetricsSnapshot, state: &m
             let start = buf.len().saturating_sub(max_lines.max(1));
             buf[start..]
                 .iter()
-                .map(|ev| {
-                    let ts = ev.ts.format("%H:%M:%S").to_string();
-                    let lvl = match ev.level {
-                        destilation_core::logging::LogLevel::Trace => "TRACE",
-                        destilation_core::logging::LogLevel::Debug => "DEBUG",
-                        destilation_core::logging::LogLevel::Info => "INFO",
-                        destilation_core::logging::LogLevel::Warn => "WARN",
-                        destilation_core::logging::LogLevel::Error => "ERROR",
-                    };
-                    let mut msg = format!("{} {} {}", ts, lvl, ev.message);
-                    if let Some(task_id) = ev.task_id.as_ref() {
-                        if task_id.len() > 8 {
-                            msg.push_str(&format!(" [{}]", &task_id[task_id.len() - 8..]));
-                        } else {
-                            msg.push_str(&format!(" [{}]", task_id));
-                        }
-                    }
-                    Line::from(msg)
-                })
+                .map(|ev| render_log_event(ev))
                 .collect::<Vec<_>>()
         } else {
-            vec![Line::from("No job selected")]
+            let start = state.global_logs.len().saturating_sub(max_lines.max(1));
+            state.global_logs[start..]
+                .iter()
+                .map(|ev| render_log_event(ev))
+                .collect::<Vec<_>>()
         };
 
         let lines = if lines.is_empty() {
@@ -2141,6 +2539,47 @@ fn render_dashboard(f: &mut Frame, area: Rect, snap: &MetricsSnapshot, state: &m
         let logs = Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL));
         f.render_widget(logs, right_chunks[2]);
     }
+}
+
+fn render_log_viewer(f: &mut Frame, area: Rect, state: &mut TuiState) {
+    let (logs, title) = if let Some(job_id) = &state.selected_job_id {
+        let job_logs = state.job_logs.get(job_id).cloned().unwrap_or_default();
+        if job_logs.is_empty() {
+            (
+                state.global_logs.clone(),
+                format!("Log Viewer - Global (Job {} has no logs) (Esc/F9 to exit)", job_id),
+            )
+        } else {
+            (
+                job_logs,
+                format!("Log Viewer - Job {} (Esc/F9 to exit)", job_id),
+            )
+        }
+    } else {
+        (
+            state.global_logs.clone(),
+            "Log Viewer - Global (Esc/F9 to exit)".to_string(),
+        )
+    };
+
+    let items: Vec<ListItem> = logs
+        .iter()
+        .rev()
+        .map(|ev| {
+            let line = render_log_event(ev);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    f.render_stateful_widget(list, area, &mut state.log_list_state);
 }
 
 fn render_job_detail(f: &mut Frame, area: Rect, state: &TuiState) {
@@ -2425,6 +2864,34 @@ fn get_f_keys(view: View) -> Vec<(&'static str, &'static str)> {
             ("F11", ""),
             ("F12", ""),
         ],
+        View::LogViewer => vec![
+            ("F1", "Help"),
+            ("F2", ""),
+            ("F3", ""),
+            ("F4", ""),
+            ("F5", ""),
+            ("F6", ""),
+            ("F7", ""),
+            ("F8", ""),
+            ("F9", "Back"),
+            ("F10", "Quit"),
+            ("F11", ""),
+            ("F12", ""),
+        ],
+        View::TemplateList => vec![
+            ("F1", "Help"),
+            ("F2", ""),
+            ("F3", ""),
+            ("F4", ""),
+            ("F5", ""),
+            ("F6", ""),
+            ("F7", "New"),
+            ("F8", "Delete"),
+            ("F9", "Back"),
+            ("F10", "Quit"),
+            ("F11", ""),
+            ("F12", ""),
+        ],
         View::ProviderTypeSelect => vec![
             ("F1", "Help"),
             ("F2", ""),
@@ -2478,6 +2945,20 @@ fn get_f_keys(view: View) -> Vec<(&'static str, &'static str)> {
             ("F8", ""),
             ("F9", "Back"),
             ("F10", "Quit"),
+            ("F11", ""),
+            ("F12", ""),
+        ],
+        View::TemplateEdit => vec![
+            ("F1", "Help"),
+            ("F2", ""),
+            ("F3", ""),
+            ("F4", ""),
+            ("F5", "Preview"),
+            ("F6", ""),
+            ("F7", ""),
+            ("F8", ""),
+            ("F9", "Cancel"),
+            ("F10", "Save"),
             ("F11", ""),
             ("F12", ""),
         ],
