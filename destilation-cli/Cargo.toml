@@ -19,3 +19,4 @@ ratatui = "0.30.0"
 crossterm = "0.29.0"
 chrono = "0.4"
 rand = "0.8"
+reqwest = { version = "0.12", features = ["json"] }

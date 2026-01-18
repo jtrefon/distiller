@@ -12,9 +12,9 @@ use destilation_core::storage::{
     FilesystemDatasetWriter, JobStore, ProviderStore,
 };
 use destilation_core::validation::Validator;
-use destilation_core::validators::DedupValidator;
-use destilation_core::validators::SemanticDedupValidator;
-use destilation_core::validators::StructuralValidator;
+use destilation_core::validators::{
+    DedupValidator, EmptyJsonValidator, SemanticDedupValidator, StructuralValidator,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -128,15 +128,15 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
     let templates = setup_templates(&gc);
     let provider_configs = setup_providers(&gc, provider_store.as_ref());
 
-    let mut providers = HashMap::new();
-    for config in &provider_configs {
-        let p = destilation_core::providers::create_provider(config.clone());
-        providers.insert(config.id().clone(), Arc::from(p));
-    }
-
     let validators = setup_validators(&gc);
     let metrics = Arc::new(InMemoryMetrics::new());
     let event_logger = Arc::new(BufferedFileEventLogger::new(2000, 500));
+
+    let mut providers = HashMap::new();
+    for config in &provider_configs {
+        let p = destilation_core::providers::create_provider(config.clone(), event_logger.clone());
+        providers.insert(config.id().clone(), Arc::from(p));
+    }
 
     let orchestrator = Orchestrator {
         job_store: job_store.clone(),
@@ -155,10 +155,10 @@ async fn run_default(config_path: Option<String>) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let _ = tx.send(TuiUpdate::Templates(templates.values().cloned().collect()));
     
-    spawn_monitor_tasks(tx, orchestrator.clone(), event_logger.clone());
+    spawn_monitor_tasks(tx.clone(), orchestrator.clone(), event_logger.clone());
 
     let (tx_cmd, rx_cmd) = std::sync::mpsc::channel();
-    spawn_command_handler(rx_cmd, orchestrator.clone());
+    spawn_command_handler(rx_cmd, tx.clone(), orchestrator.clone());
 
     // Auto-resume jobs that were already Running
     if let Ok(jobs) = job_store.list_jobs().await {
@@ -342,7 +342,10 @@ fn setup_providers(gc: &Option<GlobalConfig>, provider_store: &dyn ProviderStore
 }
 
 fn setup_validators(gc: &Option<GlobalConfig>) -> Vec<Arc<dyn Validator>> {
-    let mut validators: Vec<Arc<dyn Validator>> = vec![Arc::new(StructuralValidator::new())];
+    let mut validators: Vec<Arc<dyn Validator>> = vec![
+        Arc::new(EmptyJsonValidator::new()),
+        Arc::new(StructuralValidator::new()),
+    ];
     if let Some(jobs) = gc.as_ref().and_then(|g| g.jobs.as_ref()) {
         if let Some(job) = jobs.first() {
             let vset = job.validators.clone().unwrap_or_default();
@@ -395,7 +398,11 @@ fn spawn_monitor_tasks(tx: std::sync::mpsc::Sender<TuiUpdate>, orchestrator: Orc
     });
 }
 
-fn spawn_command_handler(rx_cmd: std::sync::mpsc::Receiver<TuiCommand>, mut orchestrator: Orchestrator) {
+fn spawn_command_handler(
+    rx_cmd: std::sync::mpsc::Receiver<TuiCommand>,
+    tx: std::sync::mpsc::Sender<TuiUpdate>,
+    mut orchestrator: Orchestrator,
+) {
     tokio::spawn(async move {
         loop {
             while let Ok(cmd) = rx_cmd.try_recv() {
@@ -429,6 +436,26 @@ fn spawn_command_handler(rx_cmd: std::sync::mpsc::Receiver<TuiCommand>, mut orch
                     }
                     TuiCommand::SaveProvider(config) => {
                         orchestrator.save_provider(config).await;
+                    }
+                    TuiCommand::TestProvider(config) => {
+                        let provider_name = config
+                            .name()
+                            .cloned()
+                            .unwrap_or_else(|| config.id().clone());
+                        let res = orchestrator.test_provider(config).await;
+                        let msg = match res {
+                            Ok(result) => format!(
+                                "Provider '{}' OK. Latency: {} ms",
+                                provider_name,
+                                result.latency.as_millis()
+                            ),
+                            Err(err) => format!(
+                                "Provider '{}' FAILED. Error: {}",
+                                provider_name,
+                                err
+                            ),
+                        };
+                        let _ = tx.send(TuiUpdate::ProviderTestResult(msg));
                     }
                     TuiCommand::DeleteProvider(id) => {
                         orchestrator.delete_provider(&id).await;

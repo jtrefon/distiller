@@ -10,10 +10,14 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1.0"
 async-trait = "0.1"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
 rand = "0.8"
 jsonschema = "0.38.1"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "process", "io-util"] }
+num_cpus = "1.16"
+futures-util = "0.3"
+tracing = "0.1"
 
 [dev-dependencies]
 async-trait = "0.1"
+httpmock = "0.7"

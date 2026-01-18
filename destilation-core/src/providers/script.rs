@@ -97,7 +97,9 @@ impl ModelProvider for ScriptProvider {
         };
 
         if !output.status.success() {
-            return Err(ProviderError::InvalidResponse);
+            let stderr = String::from_utf8(output.stderr).unwrap_or_default();
+            let msg = format!("Script Error (exit code {}): {}", output.status.code().unwrap_or(-1), stderr);
+            return Err(ProviderError::Critical(msg));
         }
 
         let output_str =

@@ -39,9 +39,6 @@ impl TaskStore for DummyStore {
     async fn enqueue_task(&self, _task: destilation_core::domain::Task) -> anyhow::Result<()> {
         unimplemented!()
     }
-    async fn fetch_next_task(&self) -> anyhow::Result<Option<destilation_core::domain::Task>> {
-        unimplemented!()
-    }
     async fn update_task(&self, _task: &destilation_core::domain::Task) -> anyhow::Result<()> {
         unimplemented!()
     }
@@ -64,6 +61,35 @@ impl DatasetWriter for DummyStore {
         unimplemented!()
     }
     async fn flush(&self) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+}
+
+#[async_trait::async_trait]
+impl destilation_core::storage::ProviderStore for DummyStore {
+    fn save_provider(&self, _provider: &destilation_core::provider::ProviderConfig) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn delete_provider(&self, _id: &String) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn list_providers(&self) -> anyhow::Result<Vec<destilation_core::provider::ProviderConfig>> {
+        unimplemented!()
+    }
+}
+
+#[async_trait::async_trait]
+impl destilation_core::storage::TemplateStore for DummyStore {
+    fn save_template(&self, _template: &destilation_core::domain::TemplateConfig) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn delete_template(&self, _id: &String) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn get_template(&self, _id: &String) -> anyhow::Result<Option<destilation_core::domain::TemplateConfig>> {
+        unimplemented!()
+    }
+    fn list_templates(&self) -> anyhow::Result<Vec<destilation_core::domain::TemplateConfig>> {
         unimplemented!()
     }
 }
@@ -135,8 +161,10 @@ async fn select_provider_respects_capabilities() {
     let orch = Orchestrator {
         job_store: Arc::new(DummyStore),
         task_store: Arc::new(DummyStore),
+        provider_store: Arc::new(DummyStore),
         providers: Arc::new(RwLock::new(providers)),
         provider_configs,
+        template_store: Arc::new(DummyStore),
         templates: HashMap::new(),
         validators: Vec::new(),
         dataset_writer: Arc::new(DummyStore),
@@ -182,8 +210,7 @@ async fn select_provider_respects_capabilities() {
             metadata: Default::default(),
         },
     };
-    let sel = orch
-        .select_provider_id(&job)
+    let sel = destilation_core::shared::select_provider_id(&job, &orch.providers, &orch.provider_configs, &orch.logger)
         .await
         .expect("provider selected");
     assert_eq!(sel, "p2");

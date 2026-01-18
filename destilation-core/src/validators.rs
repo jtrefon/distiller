@@ -8,11 +8,68 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Mutex;
 
+pub struct EmptyJsonValidator;
+
 pub struct StructuralValidator;
+
+impl EmptyJsonValidator {
+    pub fn new() -> Self {
+        Self
+    }
+}
 
 impl StructuralValidator {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for EmptyJsonValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Validator for EmptyJsonValidator {
+    fn id(&self) -> &str {
+        "empty_json"
+    }
+
+    fn validate(&self, ctx: &ValidationContext) -> ValidationOutcome {
+        let Some(parsed) = &ctx.parsed_output else {
+            return ValidationOutcome {
+                passed: true,
+                issues: vec![],
+                score: Some(0.5),
+            };
+        };
+
+        let is_empty = match parsed {
+            Value::Null => true,
+            Value::Object(obj) => obj.is_empty(),
+            _ => false,
+        };
+
+        if is_empty {
+            let mut details = HashMap::new();
+            details.insert("reason".to_string(), "empty json output".to_string());
+            return ValidationOutcome {
+                passed: false,
+                issues: vec![ValidationIssue {
+                    code: "schema.empty".to_string(),
+                    message: "output is empty JSON".to_string(),
+                    severity: ValidationSeverity::Error,
+                    details,
+                }],
+                score: Some(0.0),
+            };
+        }
+
+        ValidationOutcome {
+            passed: true,
+            issues: vec![],
+            score: Some(1.0),
+        }
     }
 }
 

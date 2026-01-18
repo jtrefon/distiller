@@ -121,16 +121,12 @@ impl ModelProvider for OpenRouterProvider {
             
             // All other errors are critical as per user requirement
             let msg = format!("OpenRouter Error {}: {}", status, body);
-            println!("{}", msg);
             return Err(ProviderError::Critical(msg));
         }
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| {
-                println!("OpenRouter JSON parse error: {:?}", e);
-                ProviderError::InvalidResponse
-            })?;
+            .map_err(|_| ProviderError::InvalidResponse)?;
         let content = body
             .pointer("/choices/0/message/content")
             .and_then(|v| v.as_str())

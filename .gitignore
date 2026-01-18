@@ -6,3 +6,8 @@
 *.db-wal
 .env
 /datasets/
+
+
+#Ignore windsurf AI rules
+.windsurfrules
+/.windsurf

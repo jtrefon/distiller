@@ -6,9 +6,10 @@ pub use ollama::OllamaProvider;
 pub use openrouter::OpenRouterProvider;
 pub use script::{ScriptConfig, ScriptProvider};
 
+use crate::logging::SharedEventLogger;
 use crate::provider::{ModelProvider, ProviderConfig};
 
-pub fn create_provider(config: ProviderConfig) -> Box<dyn ModelProvider> {
+pub fn create_provider(config: ProviderConfig, logger: SharedEventLogger) -> Box<dyn ModelProvider> {
     match config {
         ProviderConfig::OpenRouter {
             id,
@@ -24,7 +25,7 @@ pub fn create_provider(config: ProviderConfig) -> Box<dyn ModelProvider> {
             enabled: _,
             base_url,
             model,
-        } => Box::new(OllamaProvider::new(id, base_url, model)),
+        } => Box::new(OllamaProvider::new(id, base_url, model, logger)),
         ProviderConfig::Script {
             id,
             name: _,

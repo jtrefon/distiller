@@ -82,6 +82,8 @@ fn mk_ctx(parsed: serde_json::Value) -> ValidationContext {
         },
         raw_response: None,
         validation_result: None,
+        quality_score: None,
+        is_negative: false,
     };
     let provider_result = GenerationResult {
         provider_id: "mock".to_string(),

@@ -15,6 +15,37 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+struct DummyStore;
+
+#[async_trait::async_trait]
+impl destilation_core::storage::ProviderStore for DummyStore {
+    fn save_provider(&self, _provider: &destilation_core::provider::ProviderConfig) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn delete_provider(&self, _id: &String) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn list_providers(&self) -> anyhow::Result<Vec<destilation_core::provider::ProviderConfig>> {
+        unimplemented!()
+    }
+}
+
+#[async_trait::async_trait]
+impl destilation_core::storage::TemplateStore for DummyStore {
+    fn save_template(&self, _template: &destilation_core::domain::TemplateConfig) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn delete_template(&self, _id: &String) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn get_template(&self, _id: &String) -> anyhow::Result<Option<destilation_core::domain::TemplateConfig>> {
+        unimplemented!()
+    }
+    fn list_templates(&self) -> anyhow::Result<Vec<destilation_core::domain::TemplateConfig>> {
+        unimplemented!()
+    }
+}
+
 struct TestProvider;
 
 #[async_trait::async_trait]
@@ -107,8 +138,10 @@ async fn metrics_count_basic_flow() {
     let orch = Orchestrator {
         job_store,
         task_store,
+        provider_store: Arc::new(DummyStore),
         providers: Arc::new(RwLock::new(providers)),
         provider_configs,
+        template_store: Arc::new(DummyStore),
         templates,
         validators,
         dataset_writer,

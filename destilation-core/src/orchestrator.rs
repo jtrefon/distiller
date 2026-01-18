@@ -4,11 +4,10 @@ use crate::domain::{
 };
 use crate::logging::{LogEvent, LogLevel, SharedEventLogger};
 use crate::metrics::Metrics;
-use crate::provider::{GenerationRequest, ModelProvider, ProviderConfig};
+use crate::provider::{GenerationRequest, GenerationResult, ModelProvider, ProviderConfig};
+use crate::shared;
 use crate::storage::{DatasetWriter, JobStore, ProviderStore, TaskStore, TemplateStore};
 use crate::validation::{ValidationContext, ValidationOutcome, Validator};
-use rand::distributions::WeightedIndex;
-use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -69,44 +68,6 @@ impl Orchestrator {
     }
 
 
-    pub async fn select_provider_id(&self, config: &JobConfig) -> Option<String> {
-        let mut candidates: Vec<(String, f32)> = Vec::new();
-        let providers = self.providers.read().await;
-        let configs = self.provider_configs.read().await;
-
-        for spec in &config.providers {
-            // Check if provider is enabled
-            let is_enabled = configs
-                .iter()
-                .find(|c| c.id() == &spec.provider_id)
-                .map(|c| c.is_enabled())
-                .unwrap_or(false);
-
-            if !is_enabled {
-                continue;
-            }
-
-            if let Some(p) = providers.get(&spec.provider_id) {
-                let meta = p.metadata();
-                let required = &spec.capabilities_required;
-                let ok = required.is_empty()
-                    || required
-                        .iter()
-                        .all(|r| meta.capabilities.iter().any(|c| c == r));
-                if ok {
-                    candidates.push((spec.provider_id.clone(), spec.weight.max(0.0)));
-                }
-            }
-        }
-        if candidates.is_empty() {
-            return None;
-        }
-        let weights: Vec<f32> = candidates.iter().map(|(_, w)| *w).collect();
-        let dist = WeightedIndex::new(&weights).ok()?;
-        let mut rng = thread_rng();
-        let idx = dist.sample(&mut rng);
-        Some(candidates[idx].0.clone())
-    }
 
     pub async fn run_job(&self, job_id: &JobId) -> anyhow::Result<()> {
         let mut job = self.prepare_job(job_id).await?;
@@ -120,12 +81,27 @@ impl Orchestrator {
                 .with_field("max_concurrency", job.config.max_concurrency.to_string()),
         );
 
-        let run_res = self.execute_job_logic(&mut job).await;
+        // Create and start the processor
+        let processor = crate::processor::DatasetProcessor::new(
+            self.job_store.clone(),
+            self.task_store.clone(),
+            self.provider_store.clone(),
+            self.providers.clone(),
+            self.provider_configs.clone(),
+            self.template_store.clone(),
+            self.templates.clone(),
+            self.validators.clone(),
+            self.dataset_writer.clone(),
+            self.metrics.clone(),
+            self.logger.clone(),
+        );
+
+        let run_res = processor.process_job(job_id.clone()).await;
 
         let (saved, fatal_err) = match run_res {
             Ok(saved) => (saved, None),
             Err(e) => {
-                let saved = self.count_persisted_tasks(&job.id).await;
+                let saved = shared::count_persisted_tasks(&self.task_store, &job.id).await;
                 (saved, Some(e))
             }
         };
@@ -182,13 +158,20 @@ impl Orchestrator {
 
     async fn execute_job_logic(&self, job: &Job) -> anyhow::Result<u64> {
         self.reset_inflight_tasks(&job.id).await?;
-        self.ensure_tasks_enqueued(job).await?;
+        shared::ensure_tasks_enqueued(job, &self.task_store, &self.template_store, &self.templates, &self.providers, &self.provider_configs, &self.metrics, &self.logger).await?;
 
-        let mut join_set: JoinSet<anyhow::Result<TaskId>> = JoinSet::new();
+        let mut join_set: JoinSet<(TaskId, anyhow::Result<TaskId>)> = JoinSet::new();
         let max_concurrency = job.config.max_concurrency.max(1) as usize;
         let mut in_flight_ids = HashSet::new();
 
         loop {
+            self.logger.log(
+                LogEvent::new(LogLevel::Debug, "orchestrator.loop.iteration")
+                    .with_job(job.id.clone())
+                    .with_field("join_set_len", join_set.len().to_string())
+                    .with_field("in_flight_count", in_flight_ids.len().to_string()),
+            );
+
             // Check if paused
             if let Some(j) = self.job_store.get_job(&job.id).await? {
                 if j.status == crate::domain::JobStatus::Paused {
@@ -206,7 +189,7 @@ impl Orchestrator {
             );
 
             // Periodically ensure we have enough tasks enqueued (handles replacements)
-            let _ = self.ensure_tasks_enqueued(job).await;
+            shared::ensure_tasks_enqueued(job, &self.task_store, &self.template_store, &self.templates, &self.providers, &self.provider_configs, &self.metrics, &self.logger).await?;
 
             // Refill local queue if needed
             if join_set.len() < max_concurrency {
@@ -225,7 +208,7 @@ impl Orchestrator {
                         in_flight_ids.insert(task.id.clone());
                         let this = self.clone();
                         let job_clone = job.clone();
-                        join_set.spawn(async move { this.process_task(job_clone, task).await });
+                        join_set.spawn(async move { (task.id.clone(), this.process_task(job_clone, task).await) });
 
                         if join_set.len() >= max_concurrency {
                             break;
@@ -237,29 +220,40 @@ impl Orchestrator {
             if join_set.is_empty() {
                 let tasks = self.task_store.list_tasks(&job.id).await?;
                 let has_more = tasks.iter().any(|t| t.state == TaskState::Queued);
+                let persisted_count = tasks.iter().filter(|t| t.state == TaskState::Persisted).count();
+                let rejected_count = tasks.iter().filter(|t| t.state == TaskState::Rejected).count();
+                self.logger.log(
+                    LogEvent::new(LogLevel::Debug, "orchestrator.loop.check_empty")
+                        .with_job(job.id.clone())
+                        .with_field("has_more", has_more.to_string())
+                        .with_field("persisted", persisted_count.to_string())
+                        .with_field("rejected", rejected_count.to_string())
+                        .with_field("total_tasks", tasks.len().to_string()),
+                );
                 if has_more {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     continue;
                 }
+                self.logger.log(
+                    LogEvent::new(LogLevel::Info, "orchestrator.loop.break")
+                        .with_job(job.id.clone()),
+                );
                 break;
             }
 
             if let Some(res) = join_set.join_next().await {
                 match res {
-                    Ok(Ok(task_id)) => {
+                    Ok((task_id, Ok(_))) => {
                         in_flight_ids.remove(&task_id);
                     }
-                    Ok(Err(e)) => {
-                        // An error occurred during task processing.
-                        // We don't know which task failed here without returning the ID from the error.
-                        // For now, we'll clear in_flight_ids and let the next loop iteration re-evaluate.
-                        // If the error is critical, we might want to propagate it.
+                    Ok((task_id, Err(e))) => {
+                        in_flight_ids.remove(&task_id);
                         self.logger.log(
                             LogEvent::new(LogLevel::Error, "orchestrator.task_error")
                                 .with_job(job.id.clone())
+                                .with_task(task_id)
                                 .with_field("error", format!("{:?}", e)),
                         );
-                        in_flight_ids.clear();
                     }
                     Err(e) => {
                         // JoinError, likely from task cancellation or panic.
@@ -274,7 +268,7 @@ impl Orchestrator {
             }
         }
 
-        Ok(self.count_persisted_tasks(&job.id).await)
+        Ok(shared::count_persisted_tasks(&self.task_store, &job.id).await)
     }
 
     fn format_prompt(&self, pattern: &str, extra: &HashMap<String, String>) -> String {
@@ -324,88 +318,7 @@ impl Orchestrator {
         Ok(())
     }
 
-    async fn ensure_tasks_enqueued(&self, job: &Job) -> anyhow::Result<()> {
-        let existing_tasks = self.task_store.list_tasks(&job.id).await?;
-        let mut existing_ids: HashSet<String> = existing_tasks.iter().map(|t| t.id.clone()).collect();
-        
-        let persisted_count = existing_tasks.iter().filter(|t| t.state == TaskState::Persisted).count() as u64;
-        let pending_count = existing_tasks.iter().filter(|t| t.state == TaskState::Queued || t.state == TaskState::Generating || t.state == TaskState::Validating).count() as u64;
 
-        let target = job.config.target_samples;
-        let to_create = target.saturating_sub(persisted_count + pending_count);
-
-        if to_create == 0 {
-            return Ok(());
-        }
-
-        self.logger.log(
-            LogEvent::new(LogLevel::Info, "tasks.enqueue")
-                .with_job(job.id.clone())
-                .with_field("count", to_create.to_string()),
-        );
-
-        let template = self
-            .templates
-            .get(&job.config.template_id)
-            .ok_or_else(|| anyhow::anyhow!("template not found"))?
-            .clone();
-
-        let mut next_index: u64 = 1;
-        for _ in 0..to_create {
-            let provider_id = self.select_provider_id(&job.config).await.ok_or_else(|| {
-                anyhow::anyhow!("no providers available for job")
-            })?;
-
-            let mut id = format!("task-{}-{}", job.id, next_index);
-            while existing_ids.contains(&id) {
-                next_index += 1;
-                id = format!("task-{}-{}", job.id, next_index);
-            }
-            existing_ids.insert(id.clone());
-            next_index += 1;
-
-            let mut extra = HashMap::new();
-            if let Some(domain) = job.config.domains.first() {
-                extra.insert("domain".to_string(), domain.name.clone());
-                // For 'distillation' jobs with {{prompt}}, we might want a variety of prompts.
-                extra.insert("prompt".to_string(), format!("Provide a unique and complex reasoning task for {}", domain.name));
-            }
-
-            let task = Task {
-                id,
-                job_id: job.id.clone(),
-                state: TaskState::Queued,
-                attempts: 0,
-                max_attempts: job.config.validation.max_attempts,
-                provider_id: Some(provider_id),
-                domain_id: job.config.domains.first().map(|d| d.id.clone()).unwrap_or_default(),
-                template_id: job.config.template_id.clone(),
-                prompt_spec: PromptSpec {
-                    system: Some(template.system_prompt.clone()),
-                    user: template.user_prompt_pattern.clone(),
-                    extra,
-                },
-                raw_response: None,
-                validation_result: None,
-                quality_score: None,
-                is_negative: false,
-            };
-
-            self.task_store.enqueue_task(task).await?;
-            self.metrics.inc_task_enqueued();
-        }
-        Ok(())
-    }
-
-    async fn count_persisted_tasks(&self, job_id: &JobId) -> u64 {
-        self.task_store
-            .list_tasks(job_id)
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter(|t| t.state == TaskState::Persisted)
-            .count() as u64
-    }
 
     async fn process_task(&self, job: Job, mut task: Task) -> anyhow::Result<TaskId> {
         let task_id = task.id.clone();
@@ -422,7 +335,7 @@ impl Orchestrator {
         let provider_id = if let Some(id) = task.provider_id.clone() {
             id
         } else {
-            self.select_provider_id(&job.config).await.ok_or_else(|| {
+            shared::select_provider_id(&job.config, &self.providers, &self.provider_configs, &self.logger).await.ok_or_else(|| {
                 self.logger.log(
                     LogEvent::new(LogLevel::Error, "task.no_providers_available")
                         .with_job(job.id.clone())
@@ -470,7 +383,7 @@ impl Orchestrator {
         // Mode-specific instructions
         match template.mode {
             TemplateMode::Quad => {
-                system_prompt += "\n\nThis is a QUAD setup. Your response MUST include: 'context' (background info), 'question' (specific problem), 'thought' (step-by-step reasoning), and 'answer' (final result).";
+                system_prompt += "\n\nThis is a QUAD setup. Your response MUST include: 'context' (background info), 'question' (specific problem), 'thought' (step-by-step reasoning), and 'answer' (final result). Each field must be a non-empty string. Empty JSON (like {}) is invalid.";
             }
             TemplateMode::Preference => {
                 system_prompt += "\n\nThis is a PREFERENCE setup. You should provide a high-quality 'chosen' reasoning/answer pair AND a subtly flawed or suboptimal 'rejected' version.";
@@ -484,7 +397,10 @@ impl Orchestrator {
         // Inject schema instructions if not present
         if !system_prompt.contains("JSON") {
             let fields: Vec<String> = template.schema.fields.iter().map(|f| format!("'{}' ({})", f.name, f.field_type)).collect();
-            system_prompt += &format!("\n\nYour response MUST be a valid JSON object with the following fields: {}. Important: Do not include any conversational text outside the JSON block.", fields.join(", "));
+            system_prompt += &format!(
+                "\n\nYour response MUST be a valid JSON object with the following fields: {}. All fields are required and must be non-empty. Do not return empty JSON like {{}}. Important: Do not include any conversational text outside the JSON block.",
+                fields.join(", ")
+            );
         }
 
         let system_prompt_formatted = self.format_prompt(&system_prompt, &task.prompt_spec.extra);
@@ -519,7 +435,20 @@ impl Orchestrator {
                 .with_field("model", req.model.clone()),
         );
 
-        let res = match tokio::time::timeout(std::time::Duration::from_secs(60), provider.generate(req)).await {
+        let timeout_duration = {
+            let configs = self.provider_configs.read().await;
+            configs
+                .iter()
+                .find(|c| c.id() == &provider_id)
+                .and_then(|c| match c {
+                    ProviderConfig::Ollama { .. } => Some(std::time::Duration::from_secs(900)),
+                    ProviderConfig::Script { timeout_ms, .. } => timeout_ms
+                        .map(|ms| std::time::Duration::from_millis(ms)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| std::time::Duration::from_secs(60))
+        };
+        let res = match tokio::time::timeout(timeout_duration, provider.generate(req)).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 self.logger.log(
@@ -548,7 +477,6 @@ impl Orchestrator {
 
                 task.attempts += 1;
                 
-                let is_critical = matches!(e, crate::provider::ProviderError::Critical(_));
                 if let crate::provider::ProviderError::Critical(msg) = &e {
                     // Pause job immediately
                     if let Err(err) = self.pause_job(&job.id).await {
@@ -575,8 +503,16 @@ impl Orchestrator {
 
                 let is_rate_limit = matches!(e, crate::provider::ProviderError::RateLimited);
                 if is_rate_limit {
-                    task.attempts = task.attempts.saturating_sub(1);
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    self.logger.log(
+                        LogEvent::new(LogLevel::Warn, "task.rate_limited_reject")
+                            .with_job(job.id.clone())
+                            .with_task(task.id.clone())
+                            .with_field("attempts", task.attempts.to_string()),
+                    );
+                    task.state = TaskState::Rejected;
+                    self.metrics.inc_task_rejected();
+                    self.task_store.update_task(&task).await?;
+                    return Ok(task_id);
                 }
 
                 if task.attempts >= task.max_attempts {
@@ -661,6 +597,17 @@ impl Orchestrator {
         };
 
         let parsed = serde_json::from_str::<serde_json::Value>(&json_str).ok();
+        if parsed.is_none() {
+            let preview: String = raw.chars().take(200).collect();
+            self.logger.log(
+                LogEvent::new(LogLevel::Warn, "task.parse.failed")
+                    .with_job(job.id.clone())
+                    .with_task(task.id.clone())
+                    .with_dataset_dir(job.config.output.dataset_dir.clone())
+                    .with_field("raw_len", raw.len().to_string())
+                    .with_field("raw_preview", preview),
+            );
+        }
 
         let ctx = ValidationContext {
             job,
@@ -676,7 +623,13 @@ impl Orchestrator {
                 .with_task(task.id.clone()),
         );
 
-        let outcome = self.run_validators(&ctx);
+        let outcome = shared::run_validators(&self.validators, &ctx);
+        let issue_codes = outcome
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         task.validation_result = Some(outcome.clone());
         if outcome.passed {
             self.metrics.record_validator_pass();
@@ -696,7 +649,8 @@ impl Orchestrator {
                 .with_task(task.id.clone())
                 .with_dataset_dir(ctx.job.config.output.dataset_dir.clone())
                 .with_field("passed", outcome.passed.to_string())
-                .with_field("issues", outcome.issues.len().to_string()),
+                .with_field("issues", outcome.issues.len().to_string())
+                .with_field("issue_codes", issue_codes),
         );
 
         if outcome.passed {
@@ -713,20 +667,49 @@ impl Orchestrator {
                 is_negative: task.is_negative,
                 tags: vec![],
             };
-            self.dataset_writer.persist_sample(sample).await?;
-            self.metrics.inc_samples_persisted();
-            task.state = TaskState::Persisted;
-            self.metrics.inc_task_persisted();
             self.logger.log(
-                LogEvent::new(LogLevel::Info, "task.persisted")
+                LogEvent::new(LogLevel::Debug, "task.persist.attempt")
+                    .with_job(ctx.job.id.clone())
+                    .with_task(task.id.clone())
+                    .with_dataset_dir(ctx.job.config.output.dataset_dir.clone()),
+            );
+            match self.dataset_writer.persist_sample(sample).await {
+                Ok(()) => {
+                    self.metrics.inc_samples_persisted();
+                    task.state = TaskState::Persisted;
+                    self.metrics.inc_task_persisted();
+                    self.logger.log(
+                        LogEvent::new(LogLevel::Info, "task.persisted")
+                            .with_job(ctx.job.id.clone())
+                            .with_task(task.id.clone())
+                            .with_dataset_dir(ctx.job.config.output.dataset_dir.clone())
+                            .with_field("provider_id", provider_id.clone())
+                            .with_field("model", res.model.clone()),
+                    );
+                }
+                Err(e) => {
+                    self.logger.log(
+                        LogEvent::new(LogLevel::Error, "task.persist.failed")
+                            .with_job(ctx.job.id.clone())
+                            .with_task(task.id.clone())
+                            .with_dataset_dir(ctx.job.config.output.dataset_dir.clone())
+                            .with_field("error", format!("{:?}", e)),
+                    );
+                    return Err(e.into());
+                }
+            }
+        } else {
+            let preview: String = res.raw_output.chars().take(300).collect();
+            self.logger.log(
+                LogEvent::new(LogLevel::Warn, "task.validation.failed")
                     .with_job(ctx.job.id.clone())
                     .with_task(task.id.clone())
                     .with_dataset_dir(ctx.job.config.output.dataset_dir.clone())
-                    .with_field("provider_id", provider_id.clone())
-                    .with_field("model", res.model.clone()),
+                    .with_field("raw_len", res.raw_output.len().to_string())
+                    .with_field("raw_preview", preview),
             );
-        } else {
             task.attempts += 1;
+            task.raw_response = None;
             if task.attempts >= task.max_attempts {
                 task.state = TaskState::Rejected;
                 self.metrics.inc_task_rejected();
@@ -753,30 +736,6 @@ impl Orchestrator {
         Ok(task_id)
     }
 
-    fn run_validators(&self, ctx: &ValidationContext) -> ValidationOutcome {
-        let mut passed = true;
-        let mut issues = Vec::new();
-        let mut score: Option<f32> = None;
-
-        for v in &self.validators {
-            let o = v.validate(ctx);
-            if !o.passed {
-                passed = false;
-            }
-            if let Some(s) = o.score {
-                score = Some(score.map_or(s, |x| x.min(s)));
-            }
-            if !o.issues.is_empty() {
-                issues.extend(o.issues);
-            }
-        }
-
-        ValidationOutcome {
-            passed,
-            issues,
-            score,
-        }
-    }
 
     pub async fn save_provider(&self, config: ProviderConfig) {
         use crate::providers::create_provider;
@@ -791,7 +750,7 @@ impl Orchestrator {
             );
         }
 
-        let provider = create_provider(config.clone());
+        let provider = create_provider(config.clone(), self.logger.clone());
 
         // Update both maps
         {
@@ -829,6 +788,34 @@ impl Orchestrator {
                 configs.remove(pos);
             }
         }
+    }
+
+    pub async fn test_provider(&self, config: ProviderConfig) -> anyhow::Result<GenerationResult> {
+        use crate::providers::create_provider;
+        let provider_id = config.id().clone();
+        let model = match &config {
+            ProviderConfig::OpenRouter { model, .. } => model.clone(),
+            ProviderConfig::Ollama { model, .. } => model.clone(),
+            ProviderConfig::Script { .. } => "script".to_string(),
+        };
+        let provider = create_provider(config, self.logger.clone());
+        let request = GenerationRequest {
+            provider_id,
+            model,
+            prompt: PromptSpec {
+                system: None,
+                user: "hi".to_string(),
+                extra: HashMap::new(),
+            },
+            max_tokens: Some(64),
+            temperature: Some(0.2),
+            top_p: Some(1.0),
+            metadata: HashMap::new(),
+        };
+        provider
+            .generate(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("{:?}", e))
     }
 
     pub async fn list_providers(&self) -> Vec<ProviderConfig> {

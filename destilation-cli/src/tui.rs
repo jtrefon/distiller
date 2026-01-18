@@ -9,7 +9,7 @@ use destilation_core::metrics::{Metrics, MetricsSnapshot};
 use destilation_core::provider::ProviderConfig;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
@@ -28,6 +28,7 @@ pub enum TuiCommand {
     ResumeJob(String),
     DeleteJob(String),
     SaveProvider(ProviderConfig),
+    TestProvider(ProviderConfig),
     DeleteProvider(ProviderId),
     SaveTemplate(TemplateConfig),
     DeleteTemplate(destilation_core::domain::TemplateId),
@@ -40,6 +41,7 @@ pub enum TuiUpdate {
     Templates(Vec<TemplateConfig>),
     LogEvents(Vec<LogEvent>),
     ErrorPopup(String, String), // (job_id, error_message)
+    ProviderTestResult(String),
 }
 
 type JobId = String;
@@ -95,9 +97,16 @@ struct TuiState {
     samples_at_start: u64,
     tasks_at_start: u64,
     session_started_at: Option<std::time::Instant>,
+
+    // Status + activity indicator
+    last_status_message: String,
+    last_status_level: Option<destilation_core::logging::LogLevel>,
+    last_activity_at: Option<std::time::Instant>,
+    spinner_tick: usize,
     
     // Error popup
     error_popup: Option<(String, String)>, // (job_id, error_message)
+    provider_test_popup: Option<String>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -140,23 +149,7 @@ impl TuiState {
 
             model_search_query: String::new(),
             filtered_models: Vec::new(),
-            available_models: vec![
-                // Free models (verified from OpenRouter API)
-                "deepseek/deepseek-r1-0528:free".to_string(),
-                "qwen/qwen3-next-80b-a3b-instruct:free".to_string(),
-                "nvidia/nemotron-nano-12b-v2-vl:free".to_string(),
-                "nvidia/nemotron-nano-9b-v2:free".to_string(),
-                "qwen/qwen3-coder:free".to_string(),
-                "google/gemma-3n-e4b-it:free".to_string(),
-                "google/gemma-3n-e2b-it:free".to_string(),
-                "mistralai/devstral-2512:free".to_string(),
-                // Paid models
-                "openai/gpt-4o".to_string(),
-                "openai/gpt-4o-mini".to_string(),
-                "anthropic/claude-3.5-sonnet".to_string(),
-                "google/gemini-flash-1.5".to_string(),
-                "meta-llama/llama-3-70b-instruct".to_string(),
-            ],
+            available_models: Self::default_available_models(),
             model_list_state: ListState::default(),
 
             templates: Vec::new(),
@@ -184,11 +177,25 @@ impl TuiState {
             samples_at_start: 0,
             tasks_at_start: 0,
             session_started_at: None,
+            last_status_message: "Idle".to_string(),
+            last_status_level: None,
+            last_activity_at: None,
+            spinner_tick: 0,
             error_popup: None,
+            provider_test_popup: None,
         }
     }
 
+    fn record_activity(&mut self) {
+        self.last_activity_at = Some(std::time::Instant::now());
+    }
+
     fn push_log_events(&mut self, events: Vec<LogEvent>) {
+        if let Some(last) = events.last() {
+            self.last_status_message = format_status_message(last);
+            self.last_status_level = Some(last.level);
+            self.record_activity();
+        }
         for ev in events {
             if let Some(job_id) = ev.job_id.clone() {
                 let buf = self.job_logs.entry(job_id).or_default();
@@ -205,6 +212,84 @@ impl TuiState {
                 }
             }
         }
+    }
+
+    fn default_available_models() -> Vec<String> {
+        vec![
+            // Free models (verified from OpenRouter API)
+            "deepseek/deepseek-r1-0528:free".to_string(),
+            "qwen/qwen3-next-80b-a3b-instruct:free".to_string(),
+            "nvidia/nemotron-nano-12b-v2-vl:free".to_string(),
+            "nvidia/nemotron-nano-9b-v2:free".to_string(),
+            "qwen/qwen3-coder:free".to_string(),
+            "google/gemma-3n-e4b-it:free".to_string(),
+            "google/gemma-3n-e2b-it:free".to_string(),
+            "mistralai/devstral-2512:free".to_string(),
+            // Paid models
+            "openai/gpt-4o".to_string(),
+            "openai/gpt-4o-mini".to_string(),
+            "anthropic/claude-3.5-sonnet".to_string(),
+            "google/gemini-flash-1.5".to_string(),
+            "meta-llama/llama-3-70b-instruct".to_string(),
+        ]
+    }
+
+    /// Fetch available models from Ollama server
+    async fn fetch_ollama_models(base_url: &str) -> Vec<String> {
+        let client = reqwest::ClientBuilder::new()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+        
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
+                            models
+                                .iter()
+                                .filter_map(|model| model.get("name").and_then(|n| n.as_str()))
+                                .map(|name| name.to_string())
+                                .collect()
+                        } else {
+                            vec!["llama3".to_string()] // Fallback if response structure is unexpected
+                        }
+                    }
+                    Err(e) => {
+                        println!("Error parsing Ollama models response: {}", e);
+                        vec!["llama3".to_string()]
+                    }
+                }
+            }
+            Ok(resp) => {
+                println!("Ollama API returned status: {}", resp.status());
+                vec!["llama3".to_string()]
+            }
+            Err(e) => {
+                println!("Error fetching Ollama models: {}", e);
+                vec!["llama3".to_string()]
+            }
+        }
+    }
+
+    async fn set_available_models_for_provider(&mut self) {
+        self.available_models = if let Some(p) = &self.editing_provider {
+            match p {
+                ProviderConfig::Ollama { base_url, .. } => {
+                    println!("Fetching Ollama models from: {}", base_url);
+                    let models = Self::fetch_ollama_models(base_url).await;
+                    println!("Found {} Ollama models: {:?}", models.len(), models);
+                    models
+                }
+                ProviderConfig::OpenRouter { .. } => Self::default_available_models(),
+                _ => Vec::new(),
+            }
+        } else {
+            Self::default_available_models()
+        };
     }
 
     fn update_filtered_models(&mut self) {
@@ -385,6 +470,9 @@ impl Tui {
                     }
                     TuiUpdate::Tasks(job_id, tasks) => {
                         self.state.tasks.insert(job_id, tasks);
+                        self.state.last_status_message = "Tasks updated".to_string();
+                        self.state.last_status_level = Some(destilation_core::logging::LogLevel::Info);
+                        self.state.record_activity();
                     }
                     TuiUpdate::Providers(providers) => {
                         self.state.providers = providers;
@@ -406,10 +494,14 @@ impl Tui {
                     TuiUpdate::ErrorPopup(job_id, error_message) => {
                         self.state.error_popup = Some((job_id, error_message));
                     }
+                    TuiUpdate::ProviderTestResult(message) => {
+                        self.state.provider_test_popup = Some(message);
+                    }
                 }
             }
 
             let snap = self.metrics.snapshot();
+            self.state.spinner_tick = self.state.spinner_tick.wrapping_add(1);
             
             // Session logic: if something is running and we don't have a session, start one.
             // If nothing is running, clear the session tracker.
@@ -520,9 +612,9 @@ impl Tui {
                                                                         metadata: HashMap::new(),
                                                                     },
                                                                 };
-                                                                let _ = self.tx_cmd.send(
-                                                                    TuiCommand::StartJob(config),
-                                                                );
+                                                                let _ = self
+                                                                    .tx_cmd
+                                                                    .send(TuiCommand::StartJob(config));
                                                                 state.view = View::Dashboard;
                                                             }
                                                         }
@@ -633,6 +725,10 @@ impl Tui {
                                         if field_idx == 3 {
                                             if let Some(p) = &state.editing_provider {
                                                 if !matches!(p, ProviderConfig::Script { .. }) {
+                                                    // Fetch Ollama models
+                                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                                    rt.block_on(state.set_available_models_for_provider());
+
                                                     state.view = View::ModelSelect;
                                                     state.model_search_query.clear();
                                                     state.update_filtered_models();
@@ -649,6 +745,12 @@ impl Tui {
                         if state.error_popup.is_some() {
                             if key.code == KeyCode::Esc || key.code == KeyCode::Enter {
                                 state.error_popup = None;
+                            }
+                            continue;
+                        }
+                        if state.provider_test_popup.is_some() {
+                            if key.code == KeyCode::Esc || key.code == KeyCode::Enter {
+                                state.provider_test_popup = None;
                             }
                             continue;
                         }
@@ -790,7 +892,12 @@ impl Tui {
                                 }
                             }
                             KeyCode::F(5) => {
-                                if state.view == View::Dashboard || state.view == View::JobDetail {
+                                if state.view == View::ProviderEdit {
+                                    if let Some(p) = &state.editing_provider {
+                                        let _ =
+                                            self.tx_cmd.send(TuiCommand::TestProvider(p.clone()));
+                                    }
+                                } else if state.view == View::Dashboard || state.view == View::JobDetail {
                                     state.view = View::LogViewer;
                                     state.focus = FocusArea::Main;
                                 }
@@ -1118,9 +1225,16 @@ impl Tui {
                                 }
                                 KeyCode::Enter => {
                                     if state.edit_field_index == 3 {
-                                        state.view = View::ModelSelect;
-                                        state.model_search_query.clear();
-                                        state.update_filtered_models();
+                                        // Fetch Ollama models
+                                        if state.editing_provider.is_some() {
+                                            // We need to run async code from sync context
+                                            let rt = tokio::runtime::Runtime::new().unwrap();
+                                            rt.block_on(state.set_available_models_for_provider());
+                                            
+                                            state.view = View::ModelSelect;
+                                            state.model_search_query.clear();
+                                            state.update_filtered_models();
+                                        }
                                     } else if let Some(p) = &state.editing_provider {
                                         let _ =
                                             self.tx_cmd.send(TuiCommand::SaveProvider(p.clone()));
@@ -1695,10 +1809,85 @@ fn ui(f: &mut Frame, snap: &MetricsSnapshot, state: &mut TuiState) {
             .add_modifier(Modifier::BOLD)
     };
 
-    let title = Paragraph::new(title_text)
-        .style(title_style)
-        .block(Block::default().borders(Borders::ALL).title("Status"));
-    f.render_widget(title, chunks[0]);
+    let (generating, validating, queued) = in_flight_counts(state);
+    let show_spinner = state
+        .last_activity_at
+        .map(|t| t.elapsed().as_secs_f32() <= 3.0)
+        .unwrap_or(false)
+        || generating > 0
+        || validating > 0;
+    let spinner = if show_spinner {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        frames[state.spinner_tick % frames.len()]
+    } else {
+        " "
+    };
+    let status_color = match state.last_status_level {
+        Some(destilation_core::logging::LogLevel::Error) => Color::Red,
+        Some(destilation_core::logging::LogLevel::Warn) => Color::Yellow,
+        Some(destilation_core::logging::LogLevel::Info) => Color::Green,
+        Some(destilation_core::logging::LogLevel::Debug) => Color::Cyan,
+        Some(destilation_core::logging::LogLevel::Trace) => Color::Gray,
+        None => Color::White,
+    };
+    let mut total_received = 0u64;
+    let mut total_saved = 0u64;
+    let mut total_rejected = 0u64;
+    for tasks in state.tasks.values() {
+        for task in tasks {
+            if task.raw_response.is_some() {
+                total_received += 1;
+            }
+            match task.state {
+                destilation_core::domain::TaskState::Persisted => total_saved += 1,
+                destilation_core::domain::TaskState::Rejected => total_rejected += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let status_block = Block::default().borders(Borders::ALL).title("Status");
+    f.render_widget(status_block.clone(), chunks[0]);
+    let status_inner = status_block.inner(chunks[0]);
+    let status_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)].as_ref())
+        .split(status_inner);
+
+    let title_line = Line::from(Span::styled(title_text, title_style));
+    let title_widget = Paragraph::new(title_line).alignment(Alignment::Left);
+    f.render_widget(title_widget, status_chunks[0]);
+
+    let status_line = Line::from(vec![
+        Span::styled(state.last_status_message.as_str(), Style::default().fg(status_color)),
+        Span::raw(format!(
+            " | gen={} val={} queued={} | recv={} saved={} rej={} | ",
+            generating,
+            validating,
+            queued,
+            total_received,
+            total_saved,
+            total_rejected
+        )),
+        Span::styled(spinner, Style::default().fg(status_color)),
+    ]);
+    let status_widget = Paragraph::new(status_line).alignment(Alignment::Right);
+    f.render_widget(status_widget, status_chunks[1]);
+
+    if let Some(message) = &state.provider_test_popup {
+        use ratatui::widgets::Clear;
+        let block = Block::default()
+            .title("Provider Test")
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Cyan));
+        let popup_area = centered_rect(70, 40, f.area());
+        f.render_widget(Clear, popup_area);
+        let p = Paragraph::new(message.as_str())
+            .block(block)
+            .wrap(Wrap { trim: true });
+        f.render_widget(p, popup_area);
+        return;
+    }
 
     let (content_chunk, footer_chunk) = if matches!(state.view, View::Dashboard | View::JobDetail) {
         let active_job = state.jobs.iter().find(|j| j.status == destilation_core::domain::JobStatus::Running)
@@ -2215,6 +2404,39 @@ fn render_log_event(ev: &LogEvent) -> Line<'_> {
     }
 
     Line::from(spans)
+}
+
+fn format_status_message(event: &LogEvent) -> String {
+    let mut message = event.message.clone();
+    if let Some(task_id) = &event.task_id {
+        let short = if task_id.len() > 8 {
+            &task_id[task_id.len() - 8..]
+        } else {
+            task_id
+        };
+        message = format!("{} [{}]", message, short);
+    }
+    if let Some(error) = event.fields.get("error") {
+        message = format!("{}: {}", message, error);
+    }
+    message
+}
+
+fn in_flight_counts(state: &TuiState) -> (u64, u64, u64) {
+    let mut generating = 0u64;
+    let mut validating = 0u64;
+    let mut queued = 0u64;
+    for tasks in state.tasks.values() {
+        for task in tasks {
+            match task.state {
+                destilation_core::domain::TaskState::Generating => generating += 1,
+                destilation_core::domain::TaskState::Validating => validating += 1,
+                destilation_core::domain::TaskState::Queued => queued += 1,
+                _ => {}
+            }
+        }
+    }
+    (generating, validating, queued)
 }
 
 fn render_dashboard(f: &mut Frame, area: Rect, snap: &MetricsSnapshot, state: &mut TuiState) {
@@ -2925,7 +3147,7 @@ fn get_f_keys(view: View) -> Vec<(&'static str, &'static str)> {
             ("F2", "Save"),
             ("F3", ""),
             ("F4", ""),
-            ("F5", ""),
+            ("F5", "Test"),
             ("F6", ""),
             ("F7", ""),
             ("F8", ""),

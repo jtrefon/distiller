@@ -9,8 +9,8 @@ api_key_env = "OPENROUTER_API_KEY"
 model = "openai/gpt-3.5-turbo"
 
 [providers.ollama]
-base_url = "http://localhost:11434"
-model = "llama3"
+base_url = "http://localhost:12434"
+model = "ai/granite-4.0-micro:latest"
 
 [templates.general-reasoning]
 id = "general-reasoning"
