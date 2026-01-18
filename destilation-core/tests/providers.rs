@@ -222,22 +222,23 @@ async fn ollama_streaming_timeout() {
         when.method(POST).path("/api/generate");
         then.status(200)
             .header("content-type", "application/json")
-            .delay(std::time::Duration::from_secs(310)) // Longer than 300s timeout
+            .delay(std::time::Duration::from_secs(2)) // Longer than 1s stream timeout used in this test
             .body(r#"{"response":"Hello","done":true}
 "#);
     });
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(320)) // Client timeout longer than stream timeout
+        .timeout(std::time::Duration::from_secs(5)) // Client timeout longer than stream timeout
         .build()
         .unwrap();
 
-    let provider = OllamaProvider::with_client(
+    let provider = OllamaProvider::with_client_and_timeout(
         "test".to_string(),
         server.base_url(),
         "llama2".to_string(),
         client,
         logger,
+        std::time::Duration::from_secs(1), // 1s stream timeout for fast test
     );
 
     let request = GenerationRequest {

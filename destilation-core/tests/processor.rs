@@ -91,7 +91,25 @@ async fn test_processor_task_processing() {
     let task_store = Arc::new(InMemoryTaskStore::new());
     let job_store = Arc::new(InMemoryJobStore::new());
     let provider_store = Arc::new(DummyProviderStore);
-    let template_store = Arc::new(DummyTemplateStore);
+    let mut templates = std::collections::HashMap::new();
+    templates.insert(TemplateId::from("simple_qa"), TemplateConfig {
+        id: TemplateId::from("simple_qa"),
+        name: "Simple QA".to_string(),
+        description: "Q/A template".to_string(),
+        mode: TemplateMode::Simple,
+        schema: TemplateSchema {
+            version: "v1".to_string(),
+            fields: vec![
+                TemplateSchemaField { name: "question".to_string(), field_type: "string".to_string(), required: true },
+                TemplateSchemaField { name: "answer".to_string(), field_type: "string".to_string(), required: true },
+            ],
+            json_schema: None,
+        },
+        system_prompt: "You are helpful.".to_string(),
+        user_prompt_pattern: "Answer the question.".to_string(),
+        examples: vec![],
+        validators: vec!["structural".to_string()],
+    });
     let dataset_writer = Arc::new(FilesystemDatasetWriter::new("datasets/test_processor".to_string()));
 
     // Create job
@@ -153,6 +171,7 @@ async fn test_processor_task_processing() {
         dataset_writer,
         task_store.clone(),
         job_store,
+        templates.clone(),
         metrics.clone(),
         logger,
         None,
@@ -191,7 +210,25 @@ async fn test_processor_with_queue_and_workers() {
     let task_store = Arc::new(InMemoryTaskStore::new());
     let job_store = Arc::new(InMemoryJobStore::new());
     let provider_store = Arc::new(DummyProviderStore);
-    let template_store = Arc::new(DummyTemplateStore);
+    let mut templates = std::collections::HashMap::new();
+    templates.insert(TemplateId::from("simple_qa"), TemplateConfig {
+        id: TemplateId::from("simple_qa"),
+        name: "Simple QA".to_string(),
+        description: "Q/A template".to_string(),
+        mode: TemplateMode::Simple,
+        schema: TemplateSchema {
+            version: "v1".to_string(),
+            fields: vec![
+                TemplateSchemaField { name: "question".to_string(), field_type: "string".to_string(), required: true },
+                TemplateSchemaField { name: "answer".to_string(), field_type: "string".to_string(), required: true },
+            ],
+            json_schema: None,
+        },
+        system_prompt: "You are helpful.".to_string(),
+        user_prompt_pattern: "Answer the question.".to_string(),
+        examples: vec![],
+        validators: vec!["structural".to_string()],
+    });
     let dataset_writer = Arc::new(FilesystemDatasetWriter::new("datasets/test_processor_2".to_string()));
 
     // Create job
@@ -263,6 +300,7 @@ async fn test_processor_with_queue_and_workers() {
         dataset_writer,
         task_store.clone(),
         job_store,
+        templates.clone(),
         metrics.clone(),
         logger.clone(),
         None,

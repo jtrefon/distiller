@@ -21,6 +21,7 @@ pub struct StandardProcessor {
     dataset_writer: Arc<dyn DatasetWriter>,
     task_store: Arc<dyn TaskStore>,
     job_store: Arc<dyn JobStore>,
+    templates: std::collections::HashMap<crate::domain::TemplateId, crate::domain::TemplateConfig>,
     metrics: Arc<dyn Metrics>,
     logger: SharedEventLogger,
     processing_timeout: Duration,
@@ -33,6 +34,7 @@ impl StandardProcessor {
         dataset_writer: Arc<dyn DatasetWriter>,
         task_store: Arc<dyn TaskStore>,
         job_store: Arc<dyn JobStore>,
+        templates: std::collections::HashMap<crate::domain::TemplateId, crate::domain::TemplateConfig>,
         metrics: Arc<dyn Metrics>,
         logger: SharedEventLogger,
         processing_timeout: Option<Duration>,
@@ -43,6 +45,7 @@ impl StandardProcessor {
             dataset_writer,
             task_store,
             job_store,
+            templates,
             metrics,
             logger,
             processing_timeout: processing_timeout.unwrap_or(Duration::from_secs(300)),
@@ -148,6 +151,7 @@ impl DatasetProcessor {
             self.dataset_writer.clone(),
             self.task_store.clone(),
             self.job_store.clone(),
+            self.templates.clone(),
             self.metrics.clone(),
             self.logger.clone(),
             Some(Duration::from_secs(300)),
@@ -171,8 +175,14 @@ impl DatasetProcessor {
             // Check if job is paused
             job = self.job_store.get_job(&job_id).await?.ok_or_else(|| anyhow::anyhow!("Job not found"))?;
             if job.status == crate::domain::JobStatus::Paused {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
+                self.logger.log(
+                    crate::logging::LogEvent::new(
+                        crate::logging::LogLevel::Warn,
+                        "processor.jobs.paused",
+                    )
+                    .with_job(job_id.clone()),
+                );
+                return Err(anyhow::anyhow!("job paused"));
             }
 
             // Check if we have enough completed tasks
@@ -350,39 +360,60 @@ impl StandardProcessor {
             }
             Err(e) => {
                 // Handle provider errors
-                if let crate::provider::ProviderError::Critical(msg) = &e {
-                    // Pause job immediately
-                    if let Some(mut job) = self.job_store.get_job(&task.job_id).await? {
-                        job.status = crate::domain::JobStatus::Paused;
-                        if let Err(err) = self.job_store.update_job(&job).await {
-                            self.logger.log(
-                                crate::logging::LogEvent::new(
-                                    crate::logging::LogLevel::Error,
-                                    "job.pause_failed",
-                                )
-                                .with_job(task.job_id.clone())
-                                .with_field("error", err.to_string()),
-                            );
+                match e {
+                    crate::provider::ProviderError::Critical(msg) => {
+                        // Pause job immediately
+                        if let Some(mut job) = self.job_store.get_job(&task.job_id).await? {
+                            job.status = crate::domain::JobStatus::Paused;
+                            if let Err(err) = self.job_store.update_job(&job).await {
+                                self.logger.log(
+                                    crate::logging::LogEvent::new(
+                                        crate::logging::LogLevel::Error,
+                                        "job.pause_failed",
+                                    )
+                                    .with_job(task.job_id.clone())
+                                    .with_field("error", err.to_string()),
+                                );
+                            }
                         }
+                        self.logger.log(
+                            crate::logging::LogEvent::new(
+                                crate::logging::LogLevel::Error,
+                                "job.error",
+                            )
+                            .with_job(task.job_id.clone())
+                            .with_field("error", msg.clone()),
+                        );
+
+                        // Don't requeue task immediately, let resume handle it
+                        // But we need to update state so it's not lost
+                        task.state = crate::domain::TaskState::Queued;
+                        self.task_store.update_task(task).await?;
+                        // Return an error so callers can detect fatal situation
+                        return Err(anyhow::anyhow!("{}", msg));
                     }
-                    
-                    self.logger.log(
-                        crate::logging::LogEvent::new(
-                            crate::logging::LogLevel::Error,
-                            "job.error",
-                        )
-                        .with_job(task.job_id.clone())
-                        .with_field("error", msg.clone()),
-                    );
-                    
-                    // Don't requeue task immediately, let resume handle it
-                    // But we need to update state so it's not lost
-                    task.state = crate::domain::TaskState::Queued;
-                    self.task_store.update_task(task).await?;
-                    return Err(anyhow::anyhow!("{}", msg));
+                    crate::provider::ProviderError::RateLimited => {
+                        // Mark task rejected and record metric
+                        task.attempts += 1;
+                        task.state = crate::domain::TaskState::Rejected;
+                        self.metrics.inc_task_rejected();
+                        self.task_store.update_task(task).await?;
+                        // Treat as handled
+                        return Ok(());
+                    }
+                    _ => {
+                        // Other provider errors: increment attempts and requeue or reject
+                        task.attempts += 1;
+                        if task.attempts >= task.max_attempts {
+                            task.state = crate::domain::TaskState::Rejected;
+                            self.metrics.inc_task_rejected();
+                        } else {
+                            task.state = crate::domain::TaskState::Queued;
+                        }
+                        self.task_store.update_task(task).await?;
+                        return Ok(());
+                    }
                 }
-                
-                return Err(anyhow::anyhow!("Provider error: {:?}", e));
             }
         };
 
@@ -390,28 +421,39 @@ impl StandardProcessor {
         task.attempts += 1;
 
         // Validate
+        // Get the actual template from the in-memory templates map
+        let template = self
+            .templates
+            .get(&task.template_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Template '{}' not found", task.template_id))?;
+            
+        // Parse the raw response to JSON
+        let raw = generation_result.raw_output.trim();
+        let json_str = if raw.starts_with('{') {
+            raw.to_string()
+        } else {
+            // Try to extract JSON from markdown/text
+            if let Some(start) = raw.find('{') {
+                if let Some(end) = raw.rfind('}') {
+                    raw[start..=end].to_string()
+                } else {
+                    raw.to_string()
+                }
+            } else {
+                raw.to_string()
+            }
+        };
+        let parsed_output = serde_json::from_str::<serde_json::Value>(&json_str).ok();
+        
         let validation_context = crate::validation::ValidationContext {
             job: self.job_store.get_job(&task.job_id).await?.ok_or_else(|| {
                 anyhow::anyhow!("Job '{}' not found", task.job_id)
             })?,
             task: task.clone(),
-            template: crate::domain::TemplateConfig {
-                id: task.template_id.clone(),
-                name: "Default Template".to_string(),
-                description: "Default template".to_string(),
-                mode: crate::domain::TemplateMode::Simple,
-                schema: crate::domain::TemplateSchema {
-                    version: "v1".to_string(),
-                    fields: vec![],
-                    json_schema: None,
-                },
-                system_prompt: task.prompt_spec.system.clone().unwrap_or_default(),
-                user_prompt_pattern: task.prompt_spec.user.clone(),
-                examples: vec![],
-                validators: vec![],
-            },
+            template,
             provider_result: generation_result,
-            parsed_output: serde_json::from_str(&task.raw_response.as_ref().unwrap()).ok(),
+            parsed_output,
         };
 
         self.logger.log(

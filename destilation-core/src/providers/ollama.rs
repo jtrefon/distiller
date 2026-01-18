@@ -28,9 +28,11 @@ pub struct OllamaProvider {
     base_url: String,
     model: String,
     logger: SharedEventLogger,
+    stream_timeout: Duration,
 }
 
 impl OllamaProvider {
+    /// Create a new Ollama provider with the default stream timeout (300s)
     pub fn new(id: ProviderId, base_url: String, model: String, logger: SharedEventLogger) -> Self {
         let client = reqwest::ClientBuilder::new()
             .connect_timeout(Duration::from_secs(10))
@@ -44,6 +46,7 @@ impl OllamaProvider {
             base_url,
             model,
             logger,
+            stream_timeout: Duration::from_secs(300),
         }
     }
 
@@ -55,6 +58,20 @@ impl OllamaProvider {
             base_url,
             model,
             logger,
+            stream_timeout: Duration::from_secs(300),
+        }
+    }
+
+    /// Create a provider with a custom stream timeout (useful for tests)
+    pub fn with_client_and_timeout(id: ProviderId, base_url: String, model: String, client: Client, logger: SharedEventLogger, stream_timeout: Duration) -> Self {
+        Self {
+            id,
+            name: "OllamaProvider".to_string(),
+            client,
+            base_url,
+            model,
+            logger,
+            stream_timeout,
         }
     }
 
@@ -163,25 +180,23 @@ impl ModelProvider for OllamaProvider {
             "model": model_name,
             "prompt": request.prompt.user,
             "system": request.prompt.system,
-            "stream": true,
-            "format": "json"
+            "stream": true
         });
 
         self.logger.log(LogEvent::new(LogLevel::Debug, "ollama.request.send"));
         let start = std::time::Instant::now();
-        let resp = self
-            .client
-            .post(url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| {
+        let send_fut = self.client.post(url).json(&payload).send();
+        let resp = match tokio::time::timeout(self.stream_timeout, send_fut).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 if e.is_timeout() {
-                    ProviderError::Timeout
+                    return Err(ProviderError::Timeout);
                 } else {
-                    ProviderError::Transport
+                    return Err(ProviderError::Transport);
                 }
-            })?;
+            }
+            Err(_) => return Err(ProviderError::Timeout),
+        };
 
         self.logger.log(LogEvent::new(LogLevel::Debug, "ollama.request.sent").with_field("status", resp.status().to_string()));
         if !resp.status().is_success() {
@@ -193,7 +208,7 @@ impl ModelProvider for OllamaProvider {
         self.logger.log(LogEvent::new(LogLevel::Debug, "ollama.response.success").with_field("status", resp.status().to_string()));
         let mut stream = resp.bytes_stream();
 
-        let streaming_result = timeout(Duration::from_secs(300), async {
+        let streaming_result = timeout(self.stream_timeout, async {
             let mut buffer: Vec<u8> = Vec::new();
             let mut content = String::new();
             let mut done_received = false;

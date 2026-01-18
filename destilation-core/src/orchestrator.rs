@@ -110,11 +110,24 @@ impl Orchestrator {
         job.updated_at = chrono::Utc::now();
         job.finished_at = Some(chrono::Utc::now());
 
-        if fatal_err.is_none() && saved >= target {
+        if let Some(_) = &fatal_err {
+            // If a fatal error occurred, preserve a PAUSED state (set by components like processor)
+            // otherwise mark as Failed.
+            if let Some(j) = self.job_store.get_job(&job.id).await? {
+                if j.status == crate::domain::JobStatus::Paused {
+                    job.status = crate::domain::JobStatus::Paused;
+                } else {
+                    job.status = crate::domain::JobStatus::Failed;
+                }
+            } else {
+                job.status = crate::domain::JobStatus::Failed;
+            }
+        } else if saved >= target {
             job.status = crate::domain::JobStatus::Completed;
         } else {
             job.status = crate::domain::JobStatus::Failed;
         }
+
         self.job_store.update_job(&job).await?;
         
         self.logger.log(
